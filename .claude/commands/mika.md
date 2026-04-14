@@ -1,0 +1,54 @@
+---
+name: mika
+description: Claude Pilot (Python) development workflow with quality gates
+argument-hint: "[feature description]"
+disable-model-invocation: true
+---
+
+<!-- SCOPE: claude-pilot-py repo ONLY. Do NOT copy this to the meta-repo or other sub-repos. -->
+
+Run these steps in order. Do not do anything else. Do not stop between steps — complete every step through to the end.
+
+**Issue linking:** If `$ARGUMENTS` (after stripping any `branch:` prefix) starts with `#` followed by a number (e.g. `#42`) or is just a number, treat it as a GitHub issue reference. Run `gh issue view <number> --repo senara-solutions/claude-pilot-py --json number,title,body,labels` to fetch the issue details, then use the issue title and body as the feature description for the planning step. Remember the issue number for the PR step.
+
+## Worktree isolation
+
+Before running the pipeline, set up an isolated worktree:
+
+1. **Parse branch:** If `$ARGUMENTS` starts with `branch:<name>`, extract `<name>` as the branch name and strip the `branch:<name>` prefix from `$ARGUMENTS`. Otherwise, derive the branch name from args (issue → `feat|fix|chore/<number>/<kebab-title>`, free-text → `feat/<kebab>`).
+2. **Skip if no branch or no args:** If there are no arguments (backlog eval mode), skip worktree creation and run the pipeline in the current directory.
+3. **Detect existing worktree (MANDATORY):** Run `git rev-parse --git-dir` and `git rev-parse --git-common-dir`. If they differ, you are ALREADY inside a worktree. **STOP worktree setup immediately** — set `CREATED_WORKTREE=false` and proceed directly to the Pipeline section below. Do NOT attempt to create, remove, or modify any worktree. Do NOT clean up or recreate. Just use the current directory as-is.
+4. **Sync main:** Run `git fetch origin main:main` to fast-forward local `main` to match remote. If it fails (e.g., `main` is checked out with uncommitted changes), fall back to `git fetch origin` and use `origin/main` as the base ref in the next step.
+5. **Create worktree:** Set `WORKTREE=../.claude/worktrees/<sanitized-branch>/claude-pilot-py/` (sanitize branch name: replace `/` with `-`). Record `ORIGINAL_DIR=$(pwd)`.
+   - If the worktree path already exists, remove it first: `git worktree remove --force <WORKTREE>` (ignore errors).
+   - Try: `git worktree add -b <branch> <WORKTREE> main`
+   - If that fails (branch already exists): `git worktree add <WORKTREE> <branch>`
+   - cd into the worktree. Set `CREATED_WORKTREE=true`.
+
+## Pipeline
+
+1. `/ce:plan $ARGUMENTS` (if an issue was detected, pass the issue title + body instead of raw arguments)
+2. `/ce:work`
+3. `/ce:review`
+4. `/compound-engineering:resolve_todo_parallel`
+5. `/ce:compound`
+6. Run `bash scripts/verify-pipeline.sh` to verify pipeline artifacts exist. If it fails, read the error messages to identify missing artifacts, go back and produce them (run `/ce:plan` if no plan doc, `/ce:work` if no source changes), then re-run verification until it passes.
+7. Run quality gates before PR:
+   ```
+   uv run ruff check
+   uv run mypy src
+   uv run pytest
+   ```
+   Fix any failures before proceeding.
+8. Create a PR if one doesn't already exist:
+   ```
+   gh pr create --title "<title>" --body "<body>"
+   ```
+   If a GitHub issue was referenced, include `Closes #<number>` in the PR body.
+
+## Cleanup
+
+9. Do NOT remove the worktree — it persists for CI fixes, review feedback, and acceptance testing.
+10. Output `<promise>DONE</promise>` when complete.
+
+Start with worktree isolation, then step 1.
