@@ -204,11 +204,19 @@ def is_safe_build_command(sub: str) -> bool:
 # ── Safe shell commands ──────────────────────────────────────────────────────
 
 SAFE_SHELL_COMMANDS: frozenset[str] = frozenset({
+    # Read-only inspection
     "ls", "cat", "head", "tail", "wc", "find", "grep", "sed",
     "awk", "echo", "printf", "dirname", "basename",
     "realpath", "readlink", "stat", "file", "which", "type",
     "pwd", "date", "sort", "uniq", "tr", "cut", "diff",
     "comm", "test", "[",
+    # Navigation — safe leaf so compound `cd <path> && <tier1>` auto-approves.
+    # `cd` has no write side effects; path-traversal risk is addressed by the
+    # TIER3 command-substitution blockers ($(...), backticks, <(...)) that
+    # run on the raw compound before splitting.
+    "cd",
+    # `command -v <name>` is equivalent to `which <name>`; already safe.
+    "command",
 })
 
 _FIRST_WORD_RE = re.compile(r"^\s*(\S+)")
