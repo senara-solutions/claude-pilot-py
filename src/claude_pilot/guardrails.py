@@ -48,6 +48,19 @@ class SessionGuardrails:
         self._idle_task: asyncio.Task[None] | None = None
         self._abort_event = asyncio.Event()
         self._abort_reason: GuardrailAbortReason | None = None
+        # Per-turn accumulators for the in-progress turn. The Python claude-agent-sdk
+        # emits one AssistantMessage per *content block* (Thinking, Text, ToolUse...),
+        # all sharing the same `message_id`. A logical turn is the union of all events
+        # carrying the same message_id. Without this grouping, thinking-heavy turns
+        # inflate the stall count (claude-pilot-py#4).
+        self._current_message_id: str | None = None
+        self._current_turn_has_tool: bool = False
+        self._current_turn_text_len: int = 0
+        # Tracks whether we speculatively incremented stall for the current turn
+        # so we can roll it back if a later content block (same message_id) brings
+        # a tool_use.
+        self._stall_incremented_for_current_turn: bool = False
+        self._empty_incremented_for_current_turn: bool = False
         self._reset_idle_timer()
 
     @property
@@ -72,11 +85,57 @@ class SessionGuardrails:
         assert self._abort_reason is not None
         return self._abort_reason
 
-    def on_assistant_message(self, content: list[dict[str, Any]] | Any) -> None:
-        """Called on each assistant message (turn boundary)."""
-        self._turn_count += 1
+    def on_assistant_message(
+        self,
+        content: list[dict[str, Any]] | Any,
+        message_id: str | None = None,
+    ) -> None:
+        """Called on each AssistantMessage from the SDK.
 
-        # Reset idle timer unconditionally on any turn — even empty ones.
+        The Python claude-agent-sdk splits a single Claude turn into one event per
+        content block, all sharing the same `message_id`. We group by message_id
+        to count logical turns correctly (claude-pilot-py#4). When `message_id` is
+        None — older SDKs or callers without the field — each call counts as its
+        own turn (backward-compatible).
+
+        Stall/empty are evaluated speculatively at turn start (so a 5-turn run of
+        text-only events still trips at turn 5, not turn 6). When a later content
+        block in the same turn brings a `tool_use`, the speculative increment is
+        rolled back.
+        """
+        blocks = content if isinstance(content, list) else []
+        has_tool_use = any(_block_type(b) == "tool_use" for b in blocks)
+        text_len = sum(
+            len((_block_text(b) or "").strip()) for b in blocks if _block_type(b) == "text"
+        )
+
+        is_continuation = (
+            message_id is not None and message_id == self._current_message_id
+        )
+
+        if is_continuation:
+            # Same logical turn — accumulate evidence about its productivity.
+            self._current_turn_text_len += text_len
+            if has_tool_use and not self._current_turn_has_tool:
+                # tool_use just arrived in this turn — roll back any speculative
+                # stall/empty increments we made when the turn started no-tool.
+                self._current_turn_has_tool = True
+                if self._stall_incremented_for_current_turn:
+                    self._consecutive_stall_turns = max(0, self._consecutive_stall_turns - 1)
+                    self._stall_incremented_for_current_turn = False
+                if self._empty_incremented_for_current_turn:
+                    self._consecutive_empty_turns = max(0, self._consecutive_empty_turns - 1)
+                    self._empty_incremented_for_current_turn = False
+            return
+
+        # New turn boundary.
+        self._turn_count += 1
+        self._current_message_id = message_id
+        self._current_turn_has_tool = has_tool_use
+        self._current_turn_text_len = text_len
+        self._stall_incremented_for_current_turn = False
+        self._empty_incremented_for_current_turn = False
+        # Reset idle timer on each new turn — even empty ones.
         # Stall/empty detection handles degenerate-content cases; idle timeout
         # is reserved for "nothing at all" from the SDK.
         self._reset_idle_timer()
@@ -84,16 +143,15 @@ class SessionGuardrails:
         if self._turn_count < self._config.minTurnsBeforeDetection:
             return
 
-        blocks = content if isinstance(content, list) else []
-        has_tool_use = any(_block_type(b) == "tool_use" for b in blocks)
-
         if has_tool_use:
             self._consecutive_stall_turns = 0
             self._consecutive_empty_turns = 0
             return
 
-        # No tool use → stall
+        # No tool use yet → speculative stall increment (may be rolled back if
+        # a same-message_id continuation brings tool_use).
         self._consecutive_stall_turns += 1
+        self._stall_incremented_for_current_turn = True
         if (
             self._config.stallThreshold > 0
             and self._consecutive_stall_turns >= self._config.stallThreshold
@@ -105,13 +163,9 @@ class SessionGuardrails:
             return
 
         # Empty / trivial text
-        total_text_len = sum(
-            len((_block_text(b) or "").strip())
-            for b in blocks
-            if _block_type(b) == "text"
-        )
-        if total_text_len < 10:
+        if text_len < 10:
             self._consecutive_empty_turns += 1
+            self._empty_incremented_for_current_turn = True
             if (
                 self._config.emptyResponseThreshold > 0
                 and self._consecutive_empty_turns >= self._config.emptyResponseThreshold
@@ -177,13 +231,29 @@ class SessionGuardrails:
         self._abort_event.set()
 
 
+_SDK_BLOCK_CLASS_TO_TYPE: dict[str, str] = {
+    "TextBlock": "text",
+    "ThinkingBlock": "thinking",
+    "ToolUseBlock": "tool_use",
+    "ToolResultBlock": "tool_result",
+}
+
+
 def _block_type(block: Any) -> str | None:
     """Extract a content-block discriminator that works for both dict-shaped
-    SDK messages and dataclass / object instances."""
+    SDK messages and dataclass / object instances.
+
+    The claude-agent-sdk dataclasses (TextBlock, ThinkingBlock, ToolUseBlock) do
+    NOT carry a `type` attribute — the wire-format `type` field is consumed by
+    the parser. We map class names back to the Anthropic API type strings.
+    """
     if isinstance(block, dict):
         t = block.get("type")
         return t if isinstance(t, str) else None
-    return getattr(block, "type", None) if isinstance(getattr(block, "type", None), str) else type(block).__name__.lower().replace("block", "")
+    t = getattr(block, "type", None)
+    if isinstance(t, str):
+        return t
+    return _SDK_BLOCK_CLASS_TO_TYPE.get(type(block).__name__)
 
 
 def _block_text(block: Any) -> str | None:

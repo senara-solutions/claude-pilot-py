@@ -43,9 +43,10 @@ def log_text(text: str) -> None:
     write_log(f"{DIM}{text}{RESET}")
 
 
-def log_done(turns: int, cost_usd: float, duration_ms: int) -> None:
+def log_done(turns: int, cost_usd: float | None, duration_ms: int) -> None:
     secs = f"{duration_ms / 1000:.0f}"
-    _log(f"\n{GREEN}[done]{RESET} Success | {turns} turns | ${cost_usd:.2f} | {secs}s")
+    cost_str = f"${cost_usd:.2f}" if cost_usd is not None else "$?"
+    _log(f"\n{GREEN}[done]{RESET} Success | {turns} turns | {cost_str} | {secs}s")
 
 
 def log_error(subtype: str, errors: list[str]) -> None:
