@@ -158,7 +158,7 @@ def _emit_fatal(message: str) -> None:
         status="error",
         subtype="fatal",
         turns=0,
-        cost_usd=0.0,
+        cost_usd=None,
         duration_ms=0,
         errors=[message],
     )

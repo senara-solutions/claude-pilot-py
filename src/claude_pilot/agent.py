@@ -76,7 +76,7 @@ async def run_agent(
                             task_id=task_id,
                             session_id=session_id,
                             turns=guardrails.turns,
-                            cost_usd=0.0,
+                            cost_usd=None,  # unknown — ResultMessage not yet received
                             duration_ms=duration_ms,
                             termination_reason=reason.detail,
                         )
@@ -97,7 +97,10 @@ async def run_agent(
 
                 if isinstance(message, AssistantMessage):
                     session_id = getattr(message, "session_id", session_id) or session_id
-                    guardrails.on_assistant_message(_content_blocks(message))
+                    guardrails.on_assistant_message(
+                        _content_blocks(message),
+                        message_id=getattr(message, "message_id", None),
+                    )
                     for block in _content_blocks(message):
                         text = _text_of(block)
                         if text:

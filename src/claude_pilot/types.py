@@ -106,7 +106,10 @@ class ResultJson(BaseModel):
     task_id: str | None = None
     session_id: str | None = None
     turns: int
-    cost_usd: float
+    # Unknown when the session terminated before a ResultMessage arrived (e.g.
+    # guardrail trip, fatal CLI error). Serialized as absent field via
+    # `exclude_none` so downstream handlers parse it as unknown.
+    cost_usd: float | None = None
     duration_ms: int
     errors: list[str] | None = None
     termination_reason: str | None = None
