@@ -11,7 +11,6 @@ build/
 .coverage
 htmlcov/
 
-.claude/claude-pilot.json
 .claude/*.local.json
 .claude/*.local.md
 .claude/worktrees
