@@ -15,7 +15,29 @@ Run these steps in order. Do not do anything else. Do not stop between steps —
 
 Before running the pipeline, set up an isolated worktree:
 
-1. **Parse branch:** If `$ARGUMENTS` starts with `branch:<name>`, extract `<name>` as the branch name and strip the `branch:<name>` prefix from `$ARGUMENTS`. Otherwise, derive the branch name from args (issue → `feat|fix|chore/<number>/<kebab-title>`, free-text → `feat/<kebab>`).
+1. **Parse branch:** Determine the branch name using this priority order (first match wins):
+   a. **Explicit `branch:` prefix:** If `$ARGUMENTS` starts with `branch:<name>`, extract `<name>` and strip the prefix.
+   b. **Issue body callout:** If an issue was fetched above, search the issue body for a line matching `> - **Branch:**` followed by a backtick-wrapped branch name (e.g., `` `feat/31/port-sdk-wrapper` ``). Extract that branch name. This is how pre-planned tickets communicate their branch — **always use it when present**.
+   c. **Derive from args (deterministic):** Only if (a) and (b) both miss, derive the branch name using this **exact bash recipe** — do not re-derive with the LLM or substitute your own kebab-casing, since redispatches must produce the same slug:
+      ```bash
+      # Inputs: $ISSUE_NUMBER (optional, set when an issue was fetched), raw title/text
+      raw="${ISSUE_TITLE:-$ARGUMENTS}"
+      if printf '%s' "$raw" | grep -qE '^(feat|fix|chore|docs|eval|test|refactor|perf)(\([^)]+\))?: '; then
+        type=$(printf '%s' "$raw" | sed -nE 's/^([a-z]+)(\([^)]+\))?: .*$/\1/p')
+        body=$(printf '%s' "$raw" | sed -E 's/^[a-z]+(\([^)]+\))?: *//')
+      else
+        type=feat
+        body="$raw"
+      fi
+      slug=$(printf '%s' "$body" | tr '[:upper:]' '[:lower:]' \
+        | LC_ALL=C sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' \
+        | cut -c1-45 | sed -E 's/-[^-]*$//; s/-+$//')
+      if [ -n "${ISSUE_NUMBER:-}" ]; then
+        BRANCH="${type}/${ISSUE_NUMBER}/${slug}"
+      else
+        BRANCH="${type}/${slug}"
+      fi
+      ```
 2. **Skip if no branch or no args:** If there are no arguments (backlog eval mode), skip worktree creation and run the pipeline in the current directory.
 3. **Detect existing worktree (MANDATORY):** Run `git rev-parse --git-dir` and `git rev-parse --git-common-dir`. If they differ, you are ALREADY inside a worktree. **STOP worktree setup immediately** — set `CREATED_WORKTREE=false` and proceed directly to the Pipeline section below. Do NOT attempt to create, remove, or modify any worktree. Do NOT clean up or recreate. Just use the current directory as-is.
 4. **Sync main:** Run `git fetch origin main:main` to fast-forward local `main` to match remote. If it fails (e.g., `main` is checked out with uncommitted changes), fall back to `git fetch origin` and use `origin/main` as the base ref in the next step.
@@ -26,6 +48,8 @@ Before running the pipeline, set up an isolated worktree:
    - cd into the worktree. Set `CREATED_WORKTREE=true`.
 
 ## Pipeline
+
+**Branch safety (MANDATORY):** You are already on the correct branch. Run `git branch --show-current` to confirm. Do NOT create, rename, or switch branches. All commits and the PR must use the current branch. This applies to every step below — including `/ce:plan`, `/ce:work`, `/ce:review`, and PR creation.
 
 1. `/ce:plan $ARGUMENTS` (if an issue was detected, pass the issue title + body instead of raw arguments)
 2. `/ce:work`
