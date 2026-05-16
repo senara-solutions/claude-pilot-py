@@ -97,7 +97,21 @@ PilotResponse = PilotResponseAllow | PilotResponseDeny | PilotResponseAnswer
 
 class ResultJson(BaseModel):
     """Single-line JSON written to stdout on completion. Parsed by
-    mika-skills/claude-pilot/handlers/run.sh."""
+    mika-skills/claude-pilot/handlers/run.sh.
+
+    Subtype values:
+        - "success" — SDK ResultMessage reported success.
+        - "early_exit_zero_action" — fewer than CLAUDE_PILOT_MIN_TOOL_CALLS
+          tool calls observed; session re-prompted or terminated.
+        - "pipeline_incomplete" (mika#940) — CLAUDE_PILOT_REQUIRE_PR=1 set
+          (dev-pilot sessions via dispatch-lib) and the session completed
+          successfully but never invoked `gh pr create`. Indicates the
+          premature-EndTurn family — model emits `[done] Success` after
+          Edit/Compound phases without reaching git push + gh pr create.
+          Work may be stranded in the worktree.
+        - SDK termination subtypes (e.g. "error_max_turns", "error_during_execution")
+          — see SDK_TERMINATION_SUBTYPES in agent.py.
+    """
 
     model_config = ConfigDict(extra="forbid")
 

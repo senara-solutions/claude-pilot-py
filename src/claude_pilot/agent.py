@@ -9,6 +9,7 @@ to stdout when the session ends (success, error, or guardrail abort).
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 import time
 from typing import Any, Literal
@@ -124,6 +125,33 @@ async def run_agent(
                         else "error"
                     )
 
+                    # mika#940: pipeline-completion contract. If
+                    # CLAUDE_PILOT_REQUIRE_PR=1 (set by dispatch-lib for
+                    # dev-pilot sessions) and the session completed
+                    # "successfully" but never invoked `gh pr create`,
+                    # override to a `pipeline_incomplete` failure shape.
+                    # Catches the premature-EndTurn family observed on
+                    # 2026-05-02 (mika#931, #938, #939) where the model
+                    # emits `[done] Success` after Edit/Compound phases
+                    # before reaching git push + gh pr create. Defense
+                    # in depth with dispatch-lib's actual PR-existence
+                    # check on GitHub.
+                    termination_reason: str | None = (
+                        f"SDK limit reached: {subtype}" if is_sdk_termination else None
+                    )
+                    require_pr = os.environ.get("CLAUDE_PILOT_REQUIRE_PR", "").lower() in (
+                        "1",
+                        "true",
+                    )
+                    if status == "success" and require_pr and not guardrails.pr_created:
+                        subtype = "pipeline_incomplete"
+                        status = "error"
+                        termination_reason = (
+                            "Session completed without 'gh pr create' Bash call. "
+                            "CLAUDE_PILOT_REQUIRE_PR=1 was set. "
+                            "Work may be stranded in worktree."
+                        )
+
                     result = ResultJson(
                         status=status,
                         subtype=subtype,
@@ -133,9 +161,7 @@ async def run_agent(
                         cost_usd=message.total_cost_usd or 0.0,
                         duration_ms=message.duration_ms,
                         errors=errors,
-                        termination_reason=(
-                            f"SDK limit reached: {subtype}" if is_sdk_termination else None
-                        ),
+                        termination_reason=termination_reason,
                     )
                     _emit_result(result)
 

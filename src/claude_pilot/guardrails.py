@@ -61,6 +61,13 @@ class SessionGuardrails:
         # a tool_use.
         self._stall_incremented_for_current_turn: bool = False
         self._empty_incremented_for_current_turn: bool = False
+        # mika#940: track whether a `gh pr create` Bash invocation was observed
+        # in this session. Read by agent.py post-ResultMessage when
+        # CLAUDE_PILOT_REQUIRE_PR=1 (set by dispatch-lib for dev-pilot sessions);
+        # absence flips ResultJson.subtype to `pipeline_incomplete` and exits 1.
+        # Detection: any ToolUseBlock where name=="Bash" and command contains
+        # "gh pr create" (substring match, false-positives accepted per plan).
+        self._pr_created: bool = False
         self._reset_idle_timer()
 
     @property
@@ -70,6 +77,13 @@ class SessionGuardrails:
     @property
     def turns(self) -> int:
         return self._turn_count
+
+    @property
+    def pr_created(self) -> bool:
+        """True if any Bash tool_use with `gh pr create` substring was observed
+        this session. mika#940 pipeline-completion contract — read by agent.py
+        post-ResultMessage when CLAUDE_PILOT_REQUIRE_PR=1."""
+        return self._pr_created
 
     @property
     def aborted(self) -> bool:
@@ -108,6 +122,23 @@ class SessionGuardrails:
         text_len = sum(
             len((_block_text(b) or "").strip()) for b in blocks if _block_type(b) == "text"
         )
+
+        # mika#940: PR-creation detection. Scan tool_use blocks for Bash
+        # invocations whose command substring includes `gh pr create`. Set
+        # once and sticky for the rest of the session. False positives on
+        # `gh pr create --help` or string-literal occurrences are accepted
+        # per plan §Risks 1 — defense in depth from dispatch-lib's actual
+        # PR-existence check on GitHub.
+        if not self._pr_created:
+            for block in blocks:
+                if _block_type(block) != "tool_use":
+                    continue
+                if _tool_use_name(block) != "Bash":
+                    continue
+                command = _tool_use_command(block)
+                if command and "gh pr create" in command:
+                    self._pr_created = True
+                    break
 
         is_continuation = (
             message_id is not None and message_id == self._current_message_id
@@ -262,3 +293,34 @@ def _block_text(block: Any) -> str | None:
         return text if isinstance(text, str) else None
     text = getattr(block, "text", None)
     return text if isinstance(text, str) else None
+
+
+def _tool_use_name(block: Any) -> str | None:
+    """Extract tool name from a tool_use block (mika#940).
+
+    Mirrors `_block_type` / `_block_text` dual-shape handling for dict-shaped
+    SDK messages and dataclass / object instances (ToolUseBlock).
+    """
+    if isinstance(block, dict):
+        name = block.get("name")
+        return name if isinstance(name, str) else None
+    name = getattr(block, "name", None)
+    return name if isinstance(name, str) else None
+
+
+def _tool_use_command(block: Any) -> str | None:
+    """Extract the `command` field from a Bash tool_use block's input (mika#940).
+
+    The SDK normalizes Bash tool inputs to `{"command": "..."}` (string),
+    matching the documented schema. Returns None if input is missing or not a
+    string command.
+    """
+    input_obj: Any
+    if isinstance(block, dict):
+        input_obj = block.get("input")
+    else:
+        input_obj = getattr(block, "input", None)
+    if not isinstance(input_obj, dict):
+        return None
+    command = input_obj.get("command")
+    return command if isinstance(command, str) else None
