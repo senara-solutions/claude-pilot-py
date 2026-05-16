@@ -203,7 +203,7 @@ def on_assistant_message(
 
 | New private field | Purpose |
 |---|---|
-| `_current_turn_had_thinking: bool` | True if any `ThinkingBlock` was observed in the current logical turn. Set by scanning blocks for `_block_type(b) == "thinking"`. Resets at new turn boundary. |
+| `_current_turn_had_thinking_block: bool` | True if any `ThinkingBlock` was observed in the current logical turn. Set by scanning blocks for `_block_type(b) == "thinking"`. Resets at new turn boundary. Naming intentionally matches `TurnBoundaryEvent.had_thinking_block` (NF6 — symmetry between private state and exported event field). |
 
 **Session-end (final turn) signal:** Add a new method `close_final_turn() -> TurnBoundaryEvent | None`. Called by `agent.py` from the `ResultMessage` branch BEFORE `_emit_result`. Returns a `TurnBoundaryEvent` for the still-open final turn (if any), then clears internal state so it's idempotent.
 
@@ -240,7 +240,7 @@ def _on_boundary(event: TurnBoundaryEvent) -> None:
 | `src/claude_pilot/agent.py` | (a) Import `log_turn_summary`. (b) In the AssistantMessage branch, capture the return value of `on_assistant_message` and call a small local `_on_boundary` helper that emits the marker per F3 rules. (c) In the ResultMessage branch, call `guardrails.close_final_turn()` BEFORE `_emit_result` and route through `_on_boundary`. |
 | `src/claude_pilot/ui.py` | Add `log_turn_summary(turn: int, summary: str) -> None`. Single line, `DIM` color, `[turn N]` prefix. Open-string summary preserves Option B extensibility (NF2 confirmed). |
 | `tests/test_guardrails.py` | Add three test cases asserting the new return-value contract: (1) same-`message_id` continuation returns None; (2) new-`message_id` after a thinking-only turn returns `TurnBoundaryEvent(had_text=False, had_tool_use=False, had_thinking_block=True)`; (3) new-`message_id` after a text+tool turn returns event with `had_text=True, had_tool_use=True`. |
-| `tests/test_agent.py` (new) | Three integration cases asserting log output: (a) N thinking-only turns → N `[turn k] thinking-only, no actions` lines; (b) text+tool turn → no marker; (c) ResultMessage with unclosed thinking-only turn → marker fires once via `close_final_turn`. |
+| `tests/test_agent.py` (new) | Four integration cases asserting log output: (a) N thinking-only turns → N `[turn k] thinking-only, no actions` lines; (b) text+tool turn → no marker emitted at the AssistantMessage boundary; (c) ResultMessage with unclosed thinking-only turn → marker fires once via `close_final_turn`; (d) NF7 — text+tool FINAL turn closed by ResultMessage → `close_final_turn()` returns an event with `had_text=True` AND `_on_boundary` emits no marker (guards against a regression where `close_final_turn` forgets to populate `had_text`/`had_tool_use` and `_on_boundary` defensively prints `"no observable output"`). |
 
 Estimated diff: ~40 LOC source (vs. ~25 in v1 — the guardrail change adds ~15) + ~100 LOC tests.
 
@@ -311,6 +311,8 @@ If the fake-stream scaffolding proves to be > ~50 LOC of boilerplate, that's a s
 | NF3 | Add inline comment on turn-counter ordering | Comment added at the agent.py call site (adapted to the new `event.just_closed_turn` field per F2's API change). |
 | NF5 | Test design — record fake-stream rationale | Added committed-choice section with rationale; preempts code-review re-litigation. |
 | NF1, NF2, NF4 | (Non-blocking, confirmed correct) | No change. |
+| NF6 (pass-2) | Private field `_current_turn_had_thinking` vs event field `had_thinking_block` naming asymmetry | Private field renamed to `_current_turn_had_thinking_block` for symmetry. |
+| NF7 (pass-2) | Test case 2 (text+tool turn) does not exercise `close_final_turn()` suppression for a text+tool FINAL turn | Added fourth integration test case (d) covering text+tool final turn → no marker emitted via `close_final_turn`. |
 
 ## Open questions for second-pass review
 
