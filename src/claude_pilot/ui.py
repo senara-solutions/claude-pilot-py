@@ -105,6 +105,17 @@ def log_guardrail(type_: str, detail: str) -> None:
     _log(f"\n{ORANGE}[guardrail]{RESET} {BOLD}{type_}{RESET}: {detail}")
 
 
+def log_turn_summary(turn: int, summary: str) -> None:
+    """Per-turn marker for diagnostically silent turns (cpp#10).
+
+    Emitted when a logical turn produced no text and no tool calls — so the
+    operator can still see that the turn happened. Open-string `summary` lets
+    callers describe the silence ("thinking-only, no actions" /
+    "no observable output").
+    """
+    _log(f"{DIM}[turn {turn}]{RESET} {summary}")
+
+
 def log_env(env_path: str, loaded: bool, count: int) -> None:
     if loaded:
         _log(f"{DIM}[env]{RESET} path={env_path} [LOADED] vars={count}")
