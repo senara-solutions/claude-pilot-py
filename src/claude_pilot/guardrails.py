@@ -9,6 +9,7 @@ take 60-120s) and resumed afterwards.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from .types import (
@@ -17,6 +18,23 @@ from .types import (
     GuardrailConfig,
     ResolvedGuardrailConfig,
 )
+
+
+@dataclass(frozen=True)
+class TurnBoundaryEvent:
+    """Emitted when a logical turn just closed (cpp#10).
+
+    `just_closed_turn` is the 1-indexed turn number that just ENDED (not the
+    new turn that's starting). `had_text` / `had_tool_use` / `had_thinking_block`
+    summarize what the just-closed turn produced — agent.py reads these to
+    decide whether the turn was diagnostically silent and worth logging a
+    marker for.
+    """
+
+    just_closed_turn: int
+    had_text: bool
+    had_tool_use: bool
+    had_thinking_block: bool
 
 
 def resolve_guardrail_defaults(config: GuardrailConfig | None) -> ResolvedGuardrailConfig:
@@ -56,11 +74,18 @@ class SessionGuardrails:
         self._current_message_id: str | None = None
         self._current_turn_has_tool: bool = False
         self._current_turn_text_len: int = 0
+        # cpp#10: track whether the in-progress turn observed any ThinkingBlock,
+        # so the TurnBoundaryEvent for that turn can distinguish "model thought
+        # but didn't act" from "SDK emitted a truly empty turn".
+        self._current_turn_had_thinking_block: bool = False
         # Tracks whether we speculatively incremented stall for the current turn
         # so we can roll it back if a later content block (same message_id) brings
         # a tool_use.
         self._stall_incremented_for_current_turn: bool = False
         self._empty_incremented_for_current_turn: bool = False
+        # cpp#10: guards `close_final_turn()` idempotency — once the final-turn
+        # event has been emitted, subsequent calls return None.
+        self._final_turn_closed: bool = False
         # mika#940: track whether a `gh pr create` Bash invocation was observed
         # in this session. Read by agent.py post-ResultMessage when
         # CLAUDE_PILOT_REQUIRE_PR=1 (set by dispatch-lib for dev-pilot sessions);
@@ -103,7 +128,7 @@ class SessionGuardrails:
         self,
         content: list[dict[str, Any]] | Any,
         message_id: str | None = None,
-    ) -> None:
+    ) -> TurnBoundaryEvent | None:
         """Called on each AssistantMessage from the SDK.
 
         The Python claude-agent-sdk splits a single Claude turn into one event per
@@ -116,9 +141,16 @@ class SessionGuardrails:
         text-only events still trips at turn 5, not turn 6). When a later content
         block in the same turn brings a `tool_use`, the speculative increment is
         rolled back.
+
+        cpp#10: returns a `TurnBoundaryEvent` describing the just-closed turn
+        whenever this call CROSSES a turn boundary (`message_id` changed from the
+        previously-seen one). Returns `None` on same-turn continuations and on
+        the very first turn (no prior turn to close). Agent.py uses this to emit
+        a per-turn marker so thinking-only turns are still visible in the log.
         """
         blocks = content if isinstance(content, list) else []
         has_tool_use = any(_block_type(b) == "tool_use" for b in blocks)
+        has_thinking = any(_block_type(b) == "thinking" for b in blocks)
         text_len = sum(
             len((_block_text(b) or "").strip()) for b in blocks if _block_type(b) == "text"
         )
@@ -147,6 +179,8 @@ class SessionGuardrails:
         if is_continuation:
             # Same logical turn — accumulate evidence about its productivity.
             self._current_turn_text_len += text_len
+            if has_thinking and not self._current_turn_had_thinking_block:
+                self._current_turn_had_thinking_block = True
             if has_tool_use and not self._current_turn_has_tool:
                 # tool_use just arrived in this turn — roll back any speculative
                 # stall/empty increments we made when the turn started no-tool.
@@ -157,13 +191,25 @@ class SessionGuardrails:
                 if self._empty_incremented_for_current_turn:
                     self._consecutive_empty_turns = max(0, self._consecutive_empty_turns - 1)
                     self._empty_incremented_for_current_turn = False
-            return
+            return None
 
-        # New turn boundary.
+        # New turn boundary. Capture the just-closed turn's summary before
+        # resetting accumulators (cpp#10). The very first call has nothing to
+        # close — `_turn_count == 0` skips event emission.
+        boundary_event: TurnBoundaryEvent | None = None
+        if self._turn_count > 0:
+            boundary_event = TurnBoundaryEvent(
+                just_closed_turn=self._turn_count,
+                had_text=self._current_turn_text_len > 0,
+                had_tool_use=self._current_turn_has_tool,
+                had_thinking_block=self._current_turn_had_thinking_block,
+            )
+
         self._turn_count += 1
         self._current_message_id = message_id
         self._current_turn_has_tool = has_tool_use
         self._current_turn_text_len = text_len
+        self._current_turn_had_thinking_block = has_thinking
         self._stall_incremented_for_current_turn = False
         self._empty_incremented_for_current_turn = False
         # Reset idle timer on each new turn — even empty ones.
@@ -172,12 +218,12 @@ class SessionGuardrails:
         self._reset_idle_timer()
 
         if self._turn_count < self._config.minTurnsBeforeDetection:
-            return
+            return boundary_event
 
         if has_tool_use:
             self._consecutive_stall_turns = 0
             self._consecutive_empty_turns = 0
-            return
+            return boundary_event
 
         # No tool use yet → speculative stall increment (may be rolled back if
         # a same-message_id continuation brings tool_use).
@@ -191,7 +237,7 @@ class SessionGuardrails:
                 "stall_detected",
                 f"{self._consecutive_stall_turns} consecutive turns with no tool calls",
             )
-            return
+            return boundary_event
 
         # Empty / trivial text
         if text_len < 10:
@@ -207,6 +253,28 @@ class SessionGuardrails:
                 )
         else:
             self._consecutive_empty_turns = 0
+
+        return boundary_event
+
+    def close_final_turn(self) -> TurnBoundaryEvent | None:
+        """Emit a boundary event for the still-open final turn at session end
+        (cpp#10). Called by agent.py from the ResultMessage branch BEFORE
+        `_emit_result` so the marker for the last turn lands in the log if it
+        was diagnostically silent.
+
+        Idempotent: subsequent calls return `None`.
+        """
+        if self._final_turn_closed or self._turn_count == 0:
+            return None
+        event = TurnBoundaryEvent(
+            just_closed_turn=self._turn_count,
+            had_text=self._current_turn_text_len > 0,
+            had_tool_use=self._current_turn_has_tool,
+            had_thinking_block=self._current_turn_had_thinking_block,
+        )
+        self._final_turn_closed = True
+        self._current_message_id = None
+        return event
 
     def pause_idle_timer(self) -> None:
         """Cancel any pending idle-timeout task (called before relay)."""

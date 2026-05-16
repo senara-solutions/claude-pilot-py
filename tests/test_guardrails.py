@@ -13,7 +13,7 @@ from __future__ import annotations
 import pytest
 from claude_agent_sdk.types import TextBlock, ThinkingBlock, ToolUseBlock
 
-from claude_pilot.guardrails import SessionGuardrails
+from claude_pilot.guardrails import SessionGuardrails, TurnBoundaryEvent
 from claude_pilot.types import ResolvedGuardrailConfig
 
 
@@ -202,6 +202,79 @@ async def test_pr_created_is_sticky(guardrails: SessionGuardrails) -> None:
         message_id="msg_2",
     )
     assert guardrails.pr_created is True
+
+
+# ── cpp#10: TurnBoundaryEvent return-value contract ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_same_message_id_continuation_returns_none(
+    guardrails: SessionGuardrails,
+) -> None:
+    """Same-msg_id continuation is NOT a turn boundary — returns None (cpp#10)."""
+    first = guardrails.on_assistant_message([_think()], message_id="msg_1")
+    assert first is None, "Very first turn has no prior turn to close"
+    second = guardrails.on_assistant_message([_text("hi")], message_id="msg_1")
+    assert second is None, "Same-msg_id continuation must not emit a boundary event"
+
+
+@pytest.mark.asyncio
+async def test_boundary_event_after_thinking_only_turn(
+    guardrails: SessionGuardrails,
+) -> None:
+    """A new message_id after a thinking-only turn yields an event flagging
+    `had_thinking_block=True, had_text=False, had_tool_use=False` (cpp#10)."""
+    guardrails.on_assistant_message([_think()], message_id="msg_1")
+    event = guardrails.on_assistant_message([_think()], message_id="msg_2")
+    assert isinstance(event, TurnBoundaryEvent)
+    assert event.just_closed_turn == 1
+    assert event.had_thinking_block is True
+    assert event.had_text is False
+    assert event.had_tool_use is False
+
+
+@pytest.mark.asyncio
+async def test_boundary_event_after_text_and_tool_turn(
+    guardrails: SessionGuardrails,
+) -> None:
+    """A new message_id after a text+tool turn yields an event with
+    `had_text=True, had_tool_use=True` — _on_boundary will suppress the
+    marker (cpp#10)."""
+    guardrails.on_assistant_message(
+        [_think(), _text("here is the plan"), _tool()],
+        message_id="msg_1",
+    )
+    event = guardrails.on_assistant_message([_text("next")], message_id="msg_2")
+    assert isinstance(event, TurnBoundaryEvent)
+    assert event.just_closed_turn == 1
+    assert event.had_text is True
+    assert event.had_tool_use is True
+    assert event.had_thinking_block is True
+
+
+@pytest.mark.asyncio
+async def test_close_final_turn_returns_event_then_none(
+    guardrails: SessionGuardrails,
+) -> None:
+    """`close_final_turn()` emits the still-open final turn once, then is
+    idempotent (cpp#10)."""
+    guardrails.on_assistant_message([_think()], message_id="msg_1")
+    first = guardrails.close_final_turn()
+    assert isinstance(first, TurnBoundaryEvent)
+    assert first.just_closed_turn == 1
+    assert first.had_thinking_block is True
+    assert first.had_text is False
+    assert first.had_tool_use is False
+    second = guardrails.close_final_turn()
+    assert second is None, "close_final_turn must be idempotent"
+
+
+@pytest.mark.asyncio
+async def test_close_final_turn_with_no_turns(
+    guardrails: SessionGuardrails,
+) -> None:
+    """`close_final_turn()` returns None when no turn has started (cpp#10)."""
+    assert guardrails.close_final_turn() is None
 
 
 @pytest.mark.asyncio

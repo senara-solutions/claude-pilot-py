@@ -17,7 +17,7 @@ from typing import Any, Literal
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 from claude_agent_sdk.types import AssistantMessage, ResultMessage, SystemMessage
 
-from .guardrails import SessionGuardrails
+from .guardrails import SessionGuardrails, TurnBoundaryEvent
 from .permissions import CanUseTool
 from .types import ResultJson
 from .ui import (
@@ -28,6 +28,7 @@ from .ui import (
     log_init,
     log_prompt,
     log_text,
+    log_turn_summary,
 )
 
 SDK_TERMINATION_SUBTYPES = frozenset({"error_max_turns", "error_max_budget_usd"})
@@ -98,10 +99,16 @@ async def run_agent(
 
                 if isinstance(message, AssistantMessage):
                     session_id = getattr(message, "session_id", session_id) or session_id
-                    guardrails.on_assistant_message(
+                    event = guardrails.on_assistant_message(
                         _content_blocks(message),
                         message_id=getattr(message, "message_id", None),
                     )
+                    if event is not None:
+                        # event.just_closed_turn is the turn that just ENDED;
+                        # guardrails.turns now reflects the new turn that just
+                        # started. cpp#10 — surface drift turns that produced
+                        # no text and no tool calls.
+                        _on_boundary(event)
                     for block in _content_blocks(message):
                         text = _text_of(block)
                         if text:
@@ -109,6 +116,13 @@ async def run_agent(
                     continue
 
                 if isinstance(message, ResultMessage):
+                    # cpp#10: flush the marker for the still-open final turn
+                    # BEFORE _emit_result writes the result JSON line, so the
+                    # operator sees the last turn's shape if it was silent.
+                    final_event = guardrails.close_final_turn()
+                    if final_event is not None:
+                        _on_boundary(final_event)
+
                     subtype = message.subtype
                     raw_errors = getattr(message, "errors", None)
                     errors = (
@@ -221,6 +235,23 @@ def _sdk_guardrail_kwargs(config: Any) -> dict[str, Any]:
         # Leaving it out is safe — application-level guardrails still apply.
         pass
     return kwargs
+
+
+def _on_boundary(event: TurnBoundaryEvent) -> None:
+    """cpp#10: log a marker for diagnostically silent turns.
+
+    A turn that produced text or a tool_use is already visible in the log via
+    `log_text` / `permissions.py`. A turn that produced neither leaves the
+    operator with nothing to read — branch the marker on `had_thinking_block`
+    so the line accurately names what the model DID do (think) instead of
+    falsely claiming silence.
+    """
+    if event.had_text or event.had_tool_use:
+        return
+    if event.had_thinking_block:
+        log_turn_summary(event.just_closed_turn, "thinking-only, no actions")
+    else:
+        log_turn_summary(event.just_closed_turn, "no observable output")
 
 
 def _content_blocks(message: AssistantMessage) -> list[Any]:

@@ -1,0 +1,265 @@
+"""Agent integration tests — turn-boundary marker logging (cpp#10).
+
+Drives `run_agent` via a fake `ClaudeSDKClient` that yields a scripted sequence
+of SDK messages. The seam exercised is `run_agent` ↔ SDK messages ↔ guardrails
+↔ ui — the surface that actually breaks in production when a thinking-only
+turn leaves the log empty.
+
+Fake-stream over helper extraction: extracting the AssistantMessage loop into a
+testable helper would add indirection with one caller. Driving the public
+entrypoint with a fake stream keeps production code unchanged and validates
+the integrated behavior (cpp#10 plan §Test strategy).
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import pytest
+from claude_agent_sdk.types import (
+    AssistantMessage,
+    ResultMessage,
+    SystemMessage,
+    TextBlock,
+    ThinkingBlock,
+    ToolUseBlock,
+)
+
+from claude_pilot import agent as agent_module
+from claude_pilot.agent import run_agent
+from claude_pilot.guardrails import SessionGuardrails
+from claude_pilot.types import ResolvedGuardrailConfig
+
+
+def _config() -> ResolvedGuardrailConfig:
+    return ResolvedGuardrailConfig(
+        maxTurns=200,
+        maxBudgetUsd=0.0,
+        # Disable stall/empty detection so thinking-only runs don't abort early.
+        stallThreshold=0,
+        emptyResponseThreshold=0,
+        idleTimeoutMs=0,
+        minTurnsBeforeDetection=0,
+    )
+
+
+def _assistant(blocks: list[Any], message_id: str) -> AssistantMessage:
+    return AssistantMessage(content=blocks, model="claude-test", message_id=message_id)
+
+
+def _result() -> ResultMessage:
+    return ResultMessage(
+        subtype="success",
+        duration_ms=100,
+        duration_api_ms=50,
+        is_error=False,
+        num_turns=1,
+        session_id="sess_test",
+        total_cost_usd=0.0,
+    )
+
+
+def _init() -> SystemMessage:
+    return SystemMessage(subtype="init", data={"session_id": "sess_test", "model": "claude-test"})
+
+
+class _FakeClient:
+    def __init__(self, messages: list[Any]) -> None:
+        self._messages = messages
+
+    async def __aenter__(self) -> _FakeClient:
+        return self
+
+    async def __aexit__(self, *_: Any) -> None:
+        return None
+
+    async def query(self, _prompt: str) -> None:
+        return None
+
+    async def interrupt(self) -> None:
+        return None
+
+    def receive_response(self) -> Any:
+        async def gen() -> Any:
+            for m in self._messages:
+                yield m
+
+        return gen()
+
+
+def _install_fake_client(monkeypatch: pytest.MonkeyPatch, messages: list[Any]) -> None:
+    """Replace ClaudeSDKClient in agent.py with a constructor that returns a
+    FakeClient yielding the scripted message sequence."""
+
+    def _factory(*_args: Any, **_kwargs: Any) -> _FakeClient:
+        return _FakeClient(messages)
+
+    monkeypatch.setattr(agent_module, "ClaudeSDKClient", _factory)
+
+
+async def _noop_permission(*_args: Any, **_kwargs: Any) -> Any:  # pragma: no cover
+    raise AssertionError("permission handler must not be invoked in these tests")
+
+
+@pytest.mark.asyncio
+async def test_thinking_only_turns_emit_one_marker_each(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Feed N thinking-only turns (each a distinct message_id) followed by a
+    ResultMessage. Expect N `[turn k] thinking-only, no actions` markers — k-1
+    from boundary events + 1 from `close_final_turn` (cpp#10 AC 1)."""
+    n_turns = 3
+    messages: list[Any] = [_init()]
+    for i in range(n_turns):
+        messages.append(
+            _assistant([ThinkingBlock(thinking="planning", signature="sig")], f"msg_{i}")
+        )
+    messages.append(_result())
+
+    _install_fake_client(monkeypatch, messages)
+    guardrails = SessionGuardrails(_config())
+
+    exit_code = await run_agent(
+        prompt="test",
+        cwd=".",
+        verbose=False,
+        task_id=None,
+        permission_handler=_noop_permission,
+        guardrails=guardrails,
+    )
+
+    captured = capsys.readouterr()
+    err = captured.err
+    for k in range(1, n_turns + 1):
+        assert f"[turn {k}]" in err, f"missing marker for turn {k}; stderr was:\n{err}"
+        assert "thinking-only, no actions" in err
+    assert exit_code == 0
+
+
+@pytest.mark.asyncio
+async def test_text_and_tool_turn_emits_no_marker(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A turn carrying [ThinkingBlock, TextBlock, ToolUseBlock] is productive —
+    `_on_boundary` suppresses the marker for both the AssistantMessage-driven
+    boundary event AND `close_final_turn` (cpp#10 AC 2, marker-suppression
+    half).
+
+    NOTE: AC 2 in the plan also reads "assert log contains the text line".
+    That assertion exercises `_text_of` in agent.py, which has the same
+    SDK-dataclass `type`-attribute gap that `_block_type` worked around in
+    cpp#4. That latent bug is out of scope for cpp#10 (the silent-turn marker
+    fix) and is left for a follow-up. Only the marker-suppression behavior is
+    asserted here.
+    """
+    text = "here is the plan with enough content to clear text-len threshold"
+    messages: list[Any] = [
+        _init(),
+        _assistant(
+            [
+                ThinkingBlock(thinking="x", signature="sig"),
+                TextBlock(text=text),
+                ToolUseBlock(id="t1", name="Bash", input={"command": "ls"}),
+            ],
+            "msg_1",
+        ),
+        _assistant(
+            [
+                ThinkingBlock(thinking="y", signature="sig"),
+                TextBlock(text=text),
+                ToolUseBlock(id="t2", name="Bash", input={"command": "pwd"}),
+            ],
+            "msg_2",
+        ),
+        _result(),
+    ]
+    _install_fake_client(monkeypatch, messages)
+    guardrails = SessionGuardrails(_config())
+
+    await run_agent(
+        prompt="test",
+        cwd=".",
+        verbose=False,
+        task_id=None,
+        permission_handler=_noop_permission,
+        guardrails=guardrails,
+    )
+
+    err = capsys.readouterr().err
+    assert "[turn 1]" not in err, "productive turn must not emit a marker"
+    assert "[turn 2]" not in err, "productive final turn must not emit a marker via close_final_turn"
+    assert "thinking-only" not in err
+    assert "no observable output" not in err
+
+
+@pytest.mark.asyncio
+async def test_final_thinking_only_turn_marker_fires_via_close_final_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A single thinking-only AssistantMessage followed immediately by a
+    ResultMessage. No subsequent AssistantMessage means the boundary event is
+    never emitted from `on_assistant_message` — `close_final_turn()` is the
+    only path that fires the marker (cpp#10 AC 1 final-turn coverage)."""
+    messages: list[Any] = [
+        _init(),
+        _assistant([ThinkingBlock(thinking="planning", signature="sig")], "msg_1"),
+        _result(),
+    ]
+    _install_fake_client(monkeypatch, messages)
+    guardrails = SessionGuardrails(_config())
+
+    await run_agent(
+        prompt="test",
+        cwd=".",
+        verbose=False,
+        task_id=None,
+        permission_handler=_noop_permission,
+        guardrails=guardrails,
+    )
+
+    err = capsys.readouterr().err
+    assert "[turn 1]" in err, (
+        f"close_final_turn must emit the marker for the unclosed final turn; stderr was:\n{err}"
+    )
+    assert "thinking-only, no actions" in err
+
+
+@pytest.mark.asyncio
+async def test_text_only_final_turn_emits_no_marker(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """NF7 guard: if `close_final_turn` ever forgot to populate `had_text` /
+    `had_tool_use`, `_on_boundary` would defensively print 'no observable
+    output' for a text+tool final turn. Lock that out (cpp#10 plan NF7)."""
+    text = "final productive turn with sufficient observable content"
+    messages: list[Any] = [
+        _init(),
+        _assistant(
+            [
+                TextBlock(text=text),
+                ToolUseBlock(id="t1", name="Bash", input={"command": "ls"}),
+            ],
+            "msg_1",
+        ),
+        _result(),
+    ]
+    _install_fake_client(monkeypatch, messages)
+    guardrails = SessionGuardrails(_config())
+
+    await run_agent(
+        prompt="test",
+        cwd=".",
+        verbose=False,
+        task_id=None,
+        permission_handler=_noop_permission,
+        guardrails=guardrails,
+    )
+
+    err = capsys.readouterr().err
+    assert "[turn 1]" not in err
+    assert "no observable output" not in err
+    assert "thinking-only" not in err
