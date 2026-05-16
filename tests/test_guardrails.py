@@ -136,3 +136,87 @@ async def test_sdk_tool_use_block_dataclass_is_recognized(
     # Now a tool turn must reset it
     guardrails.on_assistant_message([_tool()], message_id="msg_3")
     assert guardrails._consecutive_stall_turns == 0
+
+
+# ── mika#940: pipeline-completion PR-detection ──────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_pr_created_starts_false(guardrails: SessionGuardrails) -> None:
+    """A fresh SessionGuardrails has pr_created == False (mika#940)."""
+    assert guardrails.pr_created is False
+
+
+@pytest.mark.asyncio
+async def test_pr_created_set_by_bash_gh_pr_create(
+    guardrails: SessionGuardrails,
+) -> None:
+    """A Bash tool_use containing `gh pr create` flips pr_created to True
+    (mika#940). The dispatch-lib pipeline-completion contract reads this
+    after CLAUDE_PILOT_REQUIRE_PR=1 sessions to detect premature-EndTurn."""
+    guardrails.on_assistant_message(
+        [_tool(name="Bash", input_data={"command": "gh pr create --fill"})],
+        message_id="msg_1",
+    )
+    assert guardrails.pr_created is True
+
+
+@pytest.mark.asyncio
+async def test_pr_created_not_set_by_other_bash(
+    guardrails: SessionGuardrails,
+) -> None:
+    """Bash tool_use without `gh pr create` substring does NOT flip
+    pr_created (mika#940). False-negative coverage."""
+    guardrails.on_assistant_message(
+        [_tool(name="Bash", input_data={"command": "git add -A && git commit -m x"})],
+        message_id="msg_1",
+    )
+    assert guardrails.pr_created is False
+
+
+@pytest.mark.asyncio
+async def test_pr_created_not_set_by_other_tool(
+    guardrails: SessionGuardrails,
+) -> None:
+    """A non-Bash tool_use (e.g. Edit) does NOT flip pr_created even if its
+    input string contains `gh pr create` (mika#940). Name-guard coverage."""
+    guardrails.on_assistant_message(
+        [_tool(name="Edit", input_data={"command": "gh pr create"})],
+        message_id="msg_1",
+    )
+    assert guardrails.pr_created is False
+
+
+@pytest.mark.asyncio
+async def test_pr_created_is_sticky(guardrails: SessionGuardrails) -> None:
+    """Once pr_created flips True, subsequent turns without `gh pr create`
+    do not reset it (mika#940). The PR-creation contract is per-session,
+    not per-turn."""
+    guardrails.on_assistant_message(
+        [_tool(name="Bash", input_data={"command": "gh pr create --fill"})],
+        message_id="msg_1",
+    )
+    assert guardrails.pr_created is True
+    guardrails.on_assistant_message(
+        [_tool(name="Bash", input_data={"command": "echo done"})],
+        message_id="msg_2",
+    )
+    assert guardrails.pr_created is True
+
+
+@pytest.mark.asyncio
+async def test_pr_created_substring_match(guardrails: SessionGuardrails) -> None:
+    """Substring match is sufficient (mika#940 plan §Risks 1 accepts false
+    positives). `gh pr create` embedded mid-command flips the flag."""
+    guardrails.on_assistant_message(
+        [
+            _tool(
+                name="Bash",
+                input_data={
+                    "command": "cd worktree && gh pr create --title foo && cd .."
+                },
+            )
+        ],
+        message_id="msg_1",
+    )
+    assert guardrails.pr_created is True
