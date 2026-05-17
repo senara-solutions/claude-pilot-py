@@ -71,6 +71,12 @@ def create_permission_handler(
             log_tool(tool_name, _summarize_input(tool_name, tool_input), "AUTO")
             return PermissionResultAllow(updated_input=tool_input)
 
+        # Tier 1.5 fast path — deterministic auto-answer (compact-safe)
+        auto_answer = try_tier_1_5_auto_answer(tool_name, tool_input)
+        if auto_answer is not None:
+            log_tool(tool_name, _summarize_input(tool_name, tool_input), "AUTO")
+            return _map_response(tool_name, tool_input, auto_answer)
+
         # No relay → interactive fallback
         if not relay or config is None:
             return await _interactive_fallback(tool_name, tool_input)
@@ -153,6 +159,48 @@ def _map_response(
             "answers": response.answers,
         }
     )
+
+
+# ── Tier 1.5: deterministic compact-safe auto-answer ─────────────────────────
+#
+# Mirrors mika/skills/bundled/permission-policy/system_prompt.md TIER 1.5
+# (lines 31-32): /ce:compound Phase 0 prompts choose between "full compound"
+# and "compact-safe"; headless sessions always pick "compact-safe" (see #79).
+# Ported into claude-pilot as a deterministic short-circuit so the LLM-backed
+# relay is never invoked for this class of question (mika#1191 Phase A).
+
+_COMPACT_SAFE_RE = re.compile(r"compact-safe", re.IGNORECASE)
+
+
+def try_tier_1_5_auto_answer(
+    tool_name: str,
+    tool_input: dict[str, Any],
+) -> PilotResponseAnswer | None:
+    """Auto-answer compact-safe compaction-mode questions without relay.
+
+    Returns a `PilotResponseAnswer` selecting "compact-safe" when EVERY
+    question in the tool_input contains the case-insensitive substring
+    `"compact-safe"`. Returns `None` for any other tool call or any
+    AskUserQuestion that includes a non-matching sibling question — those
+    fall through to the relay for normal handling.
+    """
+    if tool_name != "AskUserQuestion":
+        return None
+
+    questions = tool_input.get("questions")
+    if not isinstance(questions, list) or not questions:
+        return None
+
+    answers: dict[str, str] = {}
+    for q in questions:
+        if not isinstance(q, dict):
+            return None
+        question_text = q.get("question", "")
+        if not isinstance(question_text, str) or not _COMPACT_SAFE_RE.search(question_text):
+            return None
+        answers[question_text] = "compact-safe"
+
+    return PilotResponseAnswer(action="answer", answers=answers)
 
 
 async def _interactive_fallback(

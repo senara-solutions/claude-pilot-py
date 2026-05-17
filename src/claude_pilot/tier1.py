@@ -125,6 +125,7 @@ def _is_safe_sub_command(sub: str) -> bool:
         or is_safe_build_command(sub)
         or is_safe_shell_command(sub)
         or is_safe_gh_command(sub)
+        or is_safe_mika_dispatch(sub)
     )
 
 
@@ -245,7 +246,7 @@ def is_safe_shell_command(sub: str) -> bool:
 
 SAFE_GH_SUBCOMMANDS: dict[str, frozenset[str]] = {
     "pr":       frozenset({"create", "view", "list", "checkout", "diff", "checks"}),
-    "issue":    frozenset({"view", "list"}),
+    "issue":    frozenset({"view", "list", "edit", "comment"}),
     "run":      frozenset({"view", "list"}),
     "repo":     frozenset({"view"}),
     "release":  frozenset({"view", "list"}),
@@ -270,6 +271,34 @@ def is_safe_gh_command(sub: str) -> bool:
         return True
 
     return False
+
+
+# ── Safe intra-platform agent dispatch ───────────────────────────────────────
+#
+# Narrow allow-list for `mika ask --agent <agent>` calls between platform
+# agents. The `mika-arch` first-pass / second-pass groom briefs, dev-pilot
+# acceptance pings, and qa-review escalations all flow through this verb.
+# Mirrors the prose entry at mika/skills/bundled/permission-policy/system_prompt.md:21.
+#
+# Sentinel cross-ref: mika/crates/mika-agent/src/well_known_agents.rs:386-396
+# documents this as a deliberately duplicated list across languages with a
+# "if it grows beyond 5 entries OR diverges, escalate to build-time codegen"
+# callout. 3 entries < 5, so manual duplication is acceptable for Phase A.
+
+INTRA_PLATFORM_AGENTS: frozenset[str] = frozenset({
+    "mika-arch",
+    "mika-dev",
+    "mika-qa",
+})
+
+_MIKA_DISPATCH_RE = re.compile(r"^\s*mika\s+ask\s+--agent\s+(\S+)\b")
+
+
+def is_safe_mika_dispatch(sub: str) -> bool:
+    match = _MIKA_DISPATCH_RE.match(sub)
+    if not match:
+        return False
+    return match.group(1) in INTRA_PLATFORM_AGENTS
 
 
 # ── Write/Edit path safety ───────────────────────────────────────────────────
