@@ -378,6 +378,26 @@ def test_gh_issue_edit_compound_denied_if_unsafe_part() -> None:
 # ── mika#1191 Phase A — TIER 3 parity check vs system_prompt.md ──────────────
 
 
+# ── Newline command smuggling (ce:review adversarial finding ADV-1) ─────────
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Bare newline between two leaves — bash treats `\n` like `;`
+        "git status\nrm -rf /tmp",
+        "mika ask --agent mika-arch x\ncargo install backdoor-pkg",
+        "gh issue view 1\ngit push --force origin main",
+        # Carriage-return-newline pair (Windows-shaped paste)
+        "git status\r\nrm -rf /tmp",
+        # Newline inside a long compound where the tail is unsafe
+        "cd /tmp && git status\nbash -c 'rm -rf /'",
+    ],
+)
+def test_newline_smuggled_unsafe_tail_denied(command: str) -> None:
+    assert is_safe_bash_command(command) is False, command
+
+
 def test_tier3_parity_with_system_prompt() -> None:
     """Pre-implementation diff guard. system_prompt.md:39-44 enumerates the
     TIER 3 deny-list as prose. This pins each concrete command pattern from

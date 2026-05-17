@@ -169,7 +169,7 @@ def _map_response(
 # Ported into claude-pilot as a deterministic short-circuit so the LLM-backed
 # relay is never invoked for this class of question (mika#1191 Phase A).
 
-_COMPACT_SAFE_RE = re.compile(r"compact-safe", re.IGNORECASE)
+_COMPACT_SAFE_RE = re.compile(r"\bcompact-safe\b", re.IGNORECASE)
 
 
 def try_tier_1_5_auto_answer(

@@ -98,13 +98,19 @@ def is_tier3_dangerous(command: str) -> bool:
 
 # ── Safe Bash command checking ───────────────────────────────────────────────
 
-_COMPOUND_SPLIT_RE = re.compile(r"\s*(?:&&|\|\||[;|])\s*")
+_COMPOUND_SPLIT_RE = re.compile(r"\s*(?:&&|\|\||[;|\n])\s*")
 
 
 def _split_compound_command(command: str) -> list[str]:
-    """Naive split on shell operators. Not quote-aware — unsafe splits inside
-    quoted strings simply won't match any safe pattern and fall through to
-    relay. Safe by design."""
+    """Naive split on shell operators AND raw newlines. Not quote-aware —
+    unsafe splits inside quoted strings simply won't match any safe pattern
+    and fall through to relay. Safe by design.
+
+    `\\n` is included because bash treats a bare newline as a command
+    separator equivalent to `;`. Without splitting on `\\n`, a payload like
+    ``git status\\nrm -rf /`` would be evaluated as one segment, miss the
+    rm-rf regex on the second line, and auto-approve via the safe-git prefix.
+    """
     return [s for s in (part.strip() for part in _COMPOUND_SPLIT_RE.split(command)) if s]
 
 

@@ -300,15 +300,24 @@ def _extract_action(content: str) -> str | None:
 def _classify_locally(event: dict[str, Any]) -> str | None:
     """Return the action this tier1/tier1.5 path would produce, or None
     (meaning: still needs the relay).
+
+    Write/Edit tools are intentionally skipped: ``is_within_project`` requires
+    the agent's original ``cwd`` at dispatch time, which the historical
+    PilotEvent payload does not carry (see ``types.py:63-75``). Falling back
+    to ``os.getcwd()`` would produce non-deterministic classifications and
+    silently bias the resolved-locally count, so we mark them as "still needs
+    relay" — A-AC3 measures local-resolution on the events we can correctly
+    classify.
     """
     tool_name = event.get("tool_name", "")
     tool_input = event.get("tool_input", {})
     if not isinstance(tool_name, str) or not isinstance(tool_input, dict):
         return None
 
-    cwd = event.get("cwd") if isinstance(event.get("cwd"), str) else os.getcwd()
+    if tool_name in ("Write", "Edit"):
+        return None
 
-    if is_tier1_auto_approve(tool_name, tool_input, cwd or os.getcwd()):
+    if is_tier1_auto_approve(tool_name, tool_input, os.getcwd()):
         return "allow"
 
     auto_answer = try_tier_1_5_auto_answer(tool_name, tool_input)

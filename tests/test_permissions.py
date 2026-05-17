@@ -80,3 +80,48 @@ def test_malformed_question_shape_returns_none() -> None:
         {"questions": ["compact-safe"]},
     )
     assert result is None
+
+
+def test_compact_safe_word_boundary_excludes_compact_safer() -> None:
+    # Word boundary (\bcompact-safe\b) prevents matching substrings like
+    # "compact-safer" or "compact-safety", which could otherwise hijack
+    # unrelated questions through the lexical loophole flagged in ce:review.
+    result = try_tier_1_5_auto_answer(
+        "AskUserQuestion",
+        {"questions": [{"question": "Is compact-safer mode preferred?"}]},
+    )
+    assert result is None
+
+
+def test_compact_safe_word_boundary_matches_punctuated_forms() -> None:
+    # Word boundary still matches "compact-safe?", "(compact-safe)", etc.
+    for question_text in (
+        "Choose: compact-safe.",
+        "Pick (compact-safe) or full compound?",
+        'Answer with "compact-safe".',
+    ):
+        result = try_tier_1_5_auto_answer(
+            "AskUserQuestion",
+            {"questions": [{"question": question_text}]},
+        )
+        assert isinstance(result, PilotResponseAnswer), question_text
+
+
+def test_non_string_question_field_returns_none() -> None:
+    # Defensive guard: PilotEvent payloads from older mika versions may have
+    # malformed question shapes. Fall through to relay rather than crash.
+    result = try_tier_1_5_auto_answer(
+        "AskUserQuestion",
+        {"questions": [{"question": 42}]},
+    )
+    assert result is None
+
+
+def test_missing_question_key_returns_none() -> None:
+    # Dict without a "question" key gets q.get("question", "") -> "", which
+    # has no compact-safe substring, so falls through.
+    result = try_tier_1_5_auto_answer(
+        "AskUserQuestion",
+        {"questions": [{"options": ["a", "b"]}]},
+    )
+    assert result is None
