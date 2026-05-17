@@ -14,8 +14,10 @@ from pathlib import Path
 import pytest
 
 from claude_pilot.tier1 import (
+    INTRA_PLATFORM_AGENTS,
     is_safe_bash_command,
     is_safe_git_command,
+    is_safe_mika_dispatch,
     is_safe_shell_command,
     is_tier1_auto_approve,
     is_tier3_dangerous,
@@ -265,3 +267,157 @@ def test_cd_leaf_is_safe_shell() -> None:
     assert is_safe_shell_command("cd /some/path") is True
     assert is_safe_shell_command("cd") is True
     assert is_safe_shell_command("command -v lefthook") is True
+
+
+# ── mika#1191 Phase A — intra-platform agent dispatch ────────────────────────
+
+
+def test_intra_platform_agents_frozenset() -> None:
+    # Ports the prose allow-list at mika permission-policy/system_prompt.md:21.
+    # If this set diverges from well_known_agents.rs:386-396, the cross-language
+    # sentinel should escalate to build-time codegen (mika#935 follow-up).
+    assert frozenset({"mika-arch", "mika-dev", "mika-qa"}) == INTRA_PLATFORM_AGENTS
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'mika ask --agent mika-arch "@/tmp/brief.md"',
+        'mika ask --agent mika-dev "implement mika#1191"',
+        'mika ask --agent mika-qa "review PR#456"',
+    ],
+)
+def test_intra_platform_dispatch_approved(command: str) -> None:
+    assert is_safe_mika_dispatch(command) is True, command
+    assert is_safe_bash_command(command) is True, command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'mika ask --agent some-other-agent "..."',
+        'mika ask --agent mika-relay "permission check"',  # relay is target, not initiator
+        'mika ask --agent operator "..."',
+        # Wildcard rejection — never broaden the allow-list to a pattern
+        'mika ask --agent * "..."',
+    ],
+)
+def test_intra_platform_dispatch_other_agent_denied(command: str) -> None:
+    assert is_safe_mika_dispatch(command) is False, command
+    assert is_safe_bash_command(command) is False, command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'cd /tmp && mika ask --agent mika-arch "review this"',
+        'cd /data/workspace/mika-platform/mika && mika ask --agent mika-dev "groom #1234"',
+    ],
+)
+def test_intra_platform_dispatch_compound_with_cd_approved(command: str) -> None:
+    # Compound-safety inherits from is_safe_bash_command's segment splitter +
+    # the OR chain in _is_safe_sub_command. No additional regex needed.
+    assert is_safe_bash_command(command) is True, command
+
+
+def test_mika_dispatch_compound_denied_if_unsafe_part() -> None:
+    # NF4 negative case: TIER3 blocker on the compound trips even if the
+    # mika ask part is otherwise safe.
+    cmd = 'mika ask --agent mika-arch "do thing" && rm -rf /tmp'
+    assert is_safe_bash_command(cmd) is False
+    # Confirm via the deny-list rather than dispatch — the dispatch check
+    # itself never sees the compound; it's the split + tier3-on-raw chain.
+    assert is_tier3_dangerous(cmd) is True
+
+
+def test_bare_mika_command_not_dispatch() -> None:
+    # Plain `mika` (no `ask --agent`) is not the dispatch verb.
+    assert is_safe_mika_dispatch("mika status") is False
+    assert is_safe_mika_dispatch("mika ask --help") is False
+
+
+# ── mika#1191 Phase A — GitHub authoring (issue edit/comment) ────────────────
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'gh issue edit 123 --body-file /tmp/x.md',
+        'gh issue edit 1191 --add-label ready',
+        'gh issue comment 123 --body "groomed and ready"',
+        'gh issue comment 1191 --body-file /tmp/closing.md',
+    ],
+)
+def test_gh_issue_edit_comment_approved(command: str) -> None:
+    assert is_safe_bash_command(command) is True, command
+
+
+def test_gh_issue_create_not_in_tier1() -> None:
+    # `gh issue create` stays out of the allow-list — issue creation goes
+    # through the relay (auditable, intent-confirmation point).
+    assert is_safe_bash_command(
+        'gh issue create --repo senara-solutions/mika --title "x"'
+    ) is False
+
+
+def test_gh_issue_view_still_approved() -> None:
+    # Existing TIER 1 read-only — guard against accidental regression
+    # when extending the issue subcommand allow-list.
+    assert is_safe_bash_command("gh issue view 123") is True
+    assert is_safe_bash_command("gh issue list --label ready") is True
+
+
+def test_gh_issue_edit_compound_denied_if_unsafe_part() -> None:
+    # NF4 negative case: TIER3 blocker on the compound trips even if the
+    # gh issue edit part is otherwise safe.
+    cmd = 'gh issue edit 123 --body "x" && rm -rf /tmp'
+    assert is_safe_bash_command(cmd) is False
+    assert is_tier3_dangerous(cmd) is True
+
+
+# ── mika#1191 Phase A — TIER 3 parity check vs system_prompt.md ──────────────
+
+
+# ── Newline command smuggling (ce:review adversarial finding ADV-1) ─────────
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Bare newline between two leaves — bash treats `\n` like `;`
+        "git status\nrm -rf /tmp",
+        "mika ask --agent mika-arch x\ncargo install backdoor-pkg",
+        "gh issue view 1\ngit push --force origin main",
+        # Carriage-return-newline pair (Windows-shaped paste)
+        "git status\r\nrm -rf /tmp",
+        # Newline inside a long compound where the tail is unsafe
+        "cd /tmp && git status\nbash -c 'rm -rf /'",
+    ],
+)
+def test_newline_smuggled_unsafe_tail_denied(command: str) -> None:
+    assert is_safe_bash_command(command) is False, command
+
+
+def test_tier3_parity_with_system_prompt() -> None:
+    """Pre-implementation diff guard. system_prompt.md:39-44 enumerates the
+    TIER 3 deny-list as prose. This pins each concrete command pattern from
+    that prose against TIER3_PATTERNS — if either side drifts, this test
+    fails and the operator updates both surfaces in lockstep.
+
+    Expected delta during Phase A: zero (current TIER3_PATTERNS already
+    mirrors the prose list).
+    """
+    prose_tier3_commands = [
+        "rm -rf /tmp/foo",            # rm -rf
+        "git push --force origin x",  # git push --force
+        "git reset --hard HEAD~1",    # git reset --hard
+        "DROP TABLE users",           # DROP TABLE
+        "cargo publish",              # cargo publish
+        "sed -i s/a/b/ file",         # sed -i
+        "gh label delete bug",        # gh label delete
+        "gh label edit bug",          # gh label edit
+        "git push origin main",       # push to main/master
+        "git push origin master",
+    ]
+    for cmd in prose_tier3_commands:
+        assert is_tier3_dangerous(cmd) is True, cmd
