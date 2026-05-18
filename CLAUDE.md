@@ -27,6 +27,7 @@ src/claude_pilot/permissions.py  → can_use_tool: tier1 short-circuit, relay, r
 src/claude_pilot/tier1.py        → Auto-approval filter: deny-list, safe command patterns, path safety
 src/claude_pilot/transport.py    → asyncio.create_subprocess_exec transport with Pydantic validation
 src/claude_pilot/guardrails.py   → Stall / empty / idle-timeout detection with pausable idle timer
+src/claude_pilot/inbox_writer.py → mika#1189 side-channel handoff to mika-gateway orchestrator inbox
 src/claude_pilot/ui.py           → Stderr log renderer (ANSI colors)
 src/claude_pilot/types.py        → Pydantic models: PilotConfig, PilotEvent, PilotResponse, ResultJson
 src/claude_pilot/logger.py       → File + stderr sink with ANSI stripping
@@ -45,6 +46,7 @@ src/claude_pilot/logger.py       → File + stderr sink with ANSI stripping
 - **Session guardrails** detect degenerate loops (stall, empty responses, idle) and terminate cleanly with structured `ResultJson` output. SDK-native `max_turns` is passed through to the SDK. Idle timer pauses during `can_use_tool` to avoid false positives from slow relay agents.
 - **Pipeline slash commands bypass relay approval.** The `Skill` tool invocations for `/mika`, `/ce:*`, `/compound-engineering:resolve_todo_parallel`, and `/mika-doc-audit` are auto-approved at Tier 1. These are the agent's own orchestration steps — routing them through the relay exposes them to LLM-driven denials that rationalize fabricated rejections. The allow-list is in `TIER1_SAFE_SKILLS` in `src/claude_pilot/tier1.py`.
 - **Relay payload prefix.** Events are written to relay stdin as `[claude-pilot] <PilotEvent JSON>`. The prefix is load-bearing — LLM-backed relay agents key on it to distinguish claude-pilot events from user prose and webhook notifications.
+- **Orchestrator inbox side-channel (mika#1189).** On the success path, after `_emit_result(result)` in `agent.py`, the session calls `inbox_writer.post_handoff(result)` — a best-effort HTTP POST to `${MIKA_GATEWAY_URL}/orchestrator/inbox/{MIKA_ORCHESTRATOR_ID}/message`. Dual-write with the mika-platform#100 filesystem inbox; filesystem write remains canonical. Gated by `MIKA_ORCHESTRATOR_INBOX_ENABLED=1` AND a valid `MIKA_ORCHESTRATOR_ID`. Failures are logged to stderr but never change the exit code. The function returns `False` (silent no-op) when env is incomplete OR the gateway responds 404 (its own feature flag off). See `inbox_writer.py` constants and the gateway plan: `mika/docs/plans/2026-05-17-003-feat-1189-mika-gateway-orchestrator-inbox-v2-plan.md`.
 
 ## Environment Variables
 
@@ -53,6 +55,17 @@ Place a `.env` file in the package root (alongside `pyproject.toml`). Values do 
 The `.env` file is gitignored and not copied to worktrees. Autonomous sessions inherit env vars from the parent process.
 
 **Note:** Variables matching sensitive patterns (`TOKEN`, `KEY`, `SECRET`, `AUTH`, etc.) are scrubbed from the relay child process by `scrub_env()` in `transport.py`, but remain visible to the Claude Code SDK subprocess — by design. Claude Code needs tokens like `GH_TOKEN` to operate; the relay agent should not see them.
+
+### Orchestrator inbox (mika#1189)
+
+The inbox writer reads four env vars at call time — all four must be set for the side-channel post to fire:
+
+- `MIKA_ORCHESTRATOR_INBOX_ENABLED` — `1` / `true` (case-insensitive) enables; `0`, `2`, `false`, empty, or unset disables. The `2` (gateway-only cutover) value is reserved for a future ticket and currently treated as disabled to avoid silent partial cutover.
+- `MIKA_ORCHESTRATOR_ID` — orchestrator session id (1-128 chars, `[A-Za-z0-9_-]`). Exported by `scripts/mika-platform-spawn` from a cached id at `~/.mika/orchestrator/id`.
+- `MIKA_GATEWAY_URL` — base URL of the mika-gateway (e.g. `https://gateway.example`). Trailing slash is normalised away.
+- `MIKA_INTERNAL_TOKEN` — bearer token shared with the gateway (already known to claude-pilot for other paths).
+
+`MIKA_SPAWN_ID` is read opportunistically to populate the `spawn_id` correlation field; absent → null in the envelope.
 
 ## Key SDK Types
 
