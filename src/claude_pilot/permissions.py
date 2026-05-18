@@ -78,6 +78,7 @@ def create_permission_handler(
 ) -> CanUseTool:
     # Load policy once at handler creation time (cached for session).
     policy = load_policy(policy_path)
+    policy_enabled = os.environ.get("MIKA_PILOT_POLICY_DISABLED", "").strip() != "1"
 
     async def handler(
         tool_name: str,
@@ -98,7 +99,7 @@ def create_permission_handler(
             return _map_response(tool_name, tool_input, auto_answer)
 
         # Tier 2: deterministic policy-file lookup (mika#1192)
-        if os.environ.get("MIKA_PILOT_POLICY_DISABLED", "").strip() != "1":
+        if policy_enabled:
             pd = evaluate(policy, tool_name, tool_input)
             detail = _summarize_input(tool_name, tool_input)
             if pd.decision == "allow":
@@ -111,6 +112,9 @@ def create_permission_handler(
             log_policy_escalate(tool_name, detail, pd.rule_id)
             _fire_notify(tool_name, detail, pd.reason)
             return PermissionResultDeny(message=pd.reason, interrupt=False)
+
+        # TODO(mika#1193 Phase C): remove relay block below once policy has soaked ≥7 days.
+        # The relay path is only reachable when MIKA_PILOT_POLICY_DISABLED=1 (emergency rollback).
 
         # No relay → interactive fallback
         if not relay or config is None:

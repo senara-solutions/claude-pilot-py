@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import logging
-import os
-import shlex
 import shutil
+import subprocess
 
 logger = logging.getLogger(__name__)
 
@@ -14,7 +13,7 @@ def notify_escalation(text: str) -> None:
     """Fire-and-forget ``mika notify --text <text> --severity escalate``.
 
     Silent on failure -- this is a best-effort notification channel.
-    Uses os.system for simplicity since this is fire-and-forget.
+    Uses subprocess.Popen with argv list to avoid shell injection.
     """
     mika_bin = shutil.which("mika")
     if not mika_bin:
@@ -22,8 +21,12 @@ def notify_escalation(text: str) -> None:
         return
 
     try:
-        escaped_text = shlex.quote(text)
-        escaped_bin = shlex.quote(mika_bin)
-        os.system(f"{escaped_bin} notify --text {escaped_text} --severity escalate &")
+        subprocess.Popen(
+            [mika_bin, "notify", "--text", text, "--severity", "escalate"],
+            close_fds=True,
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
     except Exception:
         logger.debug("notify: mika notify failed (best-effort)", exc_info=True)

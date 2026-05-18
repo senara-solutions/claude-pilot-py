@@ -159,14 +159,9 @@ class TestEvaluateRules:
 
 
 def test_no_relay_config_graceful() -> None:
-    """Verify graceful handling when no config file exists (Change 5)."""
-    import json, tempfile
-    from pydantic import ValidationError
+    """Verify _load_config returns None when config file does not exist."""
+    import tempfile
+    from claude_pilot.cli import _load_config
     with tempfile.TemporaryDirectory() as d:
-        path = Path(d) / ".claude" / "claude-pilot.json"
-        try:
-            path.read_text(encoding="utf-8")
-            found = True
-        except FileNotFoundError:
-            found = False
-        assert not found, "Config file should not exist in temp dir"
+        result = _load_config(Path(d), None)
+        assert result is None, "_load_config should return None for missing config"
