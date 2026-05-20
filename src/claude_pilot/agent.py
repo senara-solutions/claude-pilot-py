@@ -18,6 +18,7 @@ from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 from claude_agent_sdk.types import AssistantMessage, ResultMessage, SystemMessage
 
 from .guardrails import SessionGuardrails, TurnBoundaryEvent
+from .inbox_writer import post_handoff
 from .permissions import CanUseTool
 from .types import ResultJson
 from .ui import (
@@ -178,6 +179,15 @@ async def run_agent(
                         termination_reason=termination_reason,
                     )
                     _emit_result(result)
+
+                    # mika#1189: side-channel handoff to the gateway
+                    # orchestrator inbox, alongside the existing
+                    # mika-platform#100 filesystem-inbox write. Both no-op
+                    # silently when their respective env vars are unset.
+                    # Failures here MUST NOT change exit code — _emit_result
+                    # is the canonical signal.
+                    if status == "success":
+                        post_handoff(result)
 
                     if status == "success":
                         log_done(message.num_turns, result.cost_usd, message.duration_ms)
