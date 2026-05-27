@@ -8,9 +8,10 @@ Note: Bash shell commands do NOT get path-containment checks (unlike
 Write/Edit). Static analysis of shell redirect/copy targets is impractical;
 only commands with no write side effects are safe-listed.
 
-Quote-aware metacharacter scanning (mika#946): backtick and ``$(`` rejection
-uses ``contains_unquoted_metacharacter()`` — a character-state-machine that
-mirrors the Rust ``contains_unquoted_metacharacter`` in
+Quote-aware metacharacter scanning (mika#946, mika#944): backtick, ``$(`` and
+``$'`` (ANSI-C quoting) rejection uses ``contains_unquoted_metacharacter()`` —
+a character-state-machine that mirrors the Rust
+``contains_unquoted_metacharacter`` in
 ``crates/mika-agent/src/server/permission_pre_classifier.rs``. Both sides
 follow POSIX single-quote semantics (backslash is literal inside ``'...'``).
 See the F5 sentinel comment in the Rust module for the cross-language coupling
@@ -97,7 +98,7 @@ TIER3_PATTERNS: tuple[re.Pattern[str], ...] = (
     # See mika#946 (resolution of mika#938 F5 sentinel divergence).
     re.compile(r"<\("),                                     # <(...)
     re.compile(r">\("),                                     # >(...)
-    re.compile(r"(?:^|[^<])>{1,2}(?!\()"),                  # > or >> (not process sub)
+    re.compile(r"(?<!<)>{1,2}(?!\(|&[\d-])"),               # > or >> (not process sub, not fd-manipulation)
 )
 
 
@@ -124,7 +125,7 @@ def _split_compound_command(command: str) -> list[str]:
 
 
 def contains_unquoted_metacharacter(command: str) -> bool:
-    """Return True if *command* contains an unquoted backtick or unquoted ``$(``.
+    """Return True if *command* contains an unquoted backtick, ``$(`` or ``$'``.
 
     Mirrors ``contains_unquoted_metacharacter`` in
     ``crates/mika-agent/src/server/permission_pre_classifier.rs`` (mika repo).
@@ -136,7 +137,7 @@ def contains_unquoted_metacharacter(command: str) -> bool:
     - Unterminated quotes: the scanner treats all remaining bytes as inside the
       quote (conservative — falls through to the LLM relay on malformed input).
 
-    See mika#946 (resolution of mika#938 F5 sentinel divergence).
+    See mika#944 (ANSI-C quoting bypass), mika#946 (mika#938 F5 sentinel).
     """
     n = len(command)
     i = 0
@@ -162,6 +163,10 @@ def contains_unquoted_metacharacter(command: str) -> bool:
         if ch == "`":
             return True
         if ch == "$" and i + 1 < n and command[i + 1] == "(":
+            return True
+        # $' (ANSI-C quoting — escapes like \xNN expand at execution time)
+        # mika#944: mirrors the Rust scanner's $' check.
+        if ch == "$" and i + 1 < n and command[i + 1] == "'":
             return True
         i += 1
 
