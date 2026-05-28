@@ -76,6 +76,26 @@ TIER1_SAFE_SKILLS: frozenset[str] = frozenset({
 
 # ── Deny-list ────────────────────────────────────────────────────────────────
 
+# Strip universal stderr/stdout silencing (`2>/dev/null`, `1>/dev/null`) before
+# running the TIER3_PATTERNS regex check. `is_tier3_dangerous` denies any `>`
+# redirect via the generic `(?<!<)>{1,2}(?!\(|&[\d-])` pattern below, which
+# false-positives on the universally-safe fd-to-/dev/null silencing idiom. The
+# strip pre-pass leaves the safe pattern invisible to the dangerous-pattern
+# check while preserving denial for `>file`, `>>file`, and other redirect
+# targets that could overwrite arbitrary destinations.
+#
+# Surfaced by mika#1327 dev-pilot dispatch 2026-05-28: `ls /path/ 2>/dev/null`
+# was Tier-1-denied → cpp#20 default-deny → interrupt=True halt.
+# Anchor the trailing edge with a negative lookahead instead of `\b` -- `\b`
+# fires between `l` (word) and `/` (non-word) so `2>/dev/null/etc/passwd`
+# would strip to `/etc/passwd` and slip past the redirect-to-file check.
+# The negative lookahead `(?![/\w.])` rejects additional path/word/dot
+# characters, blocking `/dev/nullified`, `/dev/null.txt`, and path-suffix
+# attacks while permitting whitespace, end-of-string, or shell separators
+# (`;`, `&`, `|`, `)`, `>`, `<`).
+_FD_DEVNULL_RE = re.compile(r"\b\d+>/dev/null(?![/\w.])")
+
+
 TIER3_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"rm\s+(-\w*r\w*f|-\w*f\w*r)\b"),           # rm -rf, rm -fr, rm -rfi
     re.compile(r"git\s+push\s+.*--force\b"),                # git push --force
@@ -103,7 +123,11 @@ TIER3_PATTERNS: tuple[re.Pattern[str], ...] = (
 
 
 def is_tier3_dangerous(command: str) -> bool:
-    return any(p.search(command) for p in TIER3_PATTERNS)
+    # Strip universal fd-to-/dev/null silencing before the dangerous-pattern
+    # check (see _FD_DEVNULL_RE comment). The strip is invisible to all other
+    # patterns; only the bare-`>` redirect pattern is affected.
+    stripped = _FD_DEVNULL_RE.sub("", command)
+    return any(p.search(stripped) for p in TIER3_PATTERNS)
 
 
 # ── Safe Bash command checking ───────────────────────────────────────────────
