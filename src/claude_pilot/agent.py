@@ -284,9 +284,8 @@ def _text_of(block: Any) -> str | None:
             return text if isinstance(text, str) else None
         return None
     t = getattr(block, "type", None)
-    if not isinstance(t, str):
-        if type(block).__name__ == "TextBlock":
-            t = "text"
+    if not isinstance(t, str) and type(block).__name__ == "TextBlock":
+        t = "text"
     if t == "text":
         text = getattr(block, "text", None)
         return text if isinstance(text, str) else None
