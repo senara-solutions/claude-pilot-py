@@ -48,7 +48,7 @@ async def run_agent(
     """Run the agent session. Returns the intended process exit code."""
     start_time = time.monotonic()
     session_id: str | None = None
-    seen_init = False
+    seen_init: bool = False
     config = guardrails.config
 
     log_guardrail_config(config)

@@ -328,7 +328,19 @@ async def test_multi_init_logs_reconnect_after_first(
     audits don't see fake re-dispatches.
 
     Mirrors the original incident shape: three rapid inits in a row.
+
+    Also pins the invariant that `log_prompt` (file-log sink, invisible to
+    capsys) is called exactly once across the reconnect sequence — guards
+    against a future refactor that moves the prompt emission out of the
+    `if not seen_init` branch.
     """
+    prompt_calls: list[str] = []
+
+    def _record_prompt(prompt: str) -> None:
+        prompt_calls.append(prompt)
+
+    monkeypatch.setattr(agent_module, "log_prompt", _record_prompt)
+
     messages: list[Any] = [_init(), _init(), _init(), _result()]
 
     _install_fake_client(monkeypatch, messages)
@@ -347,4 +359,5 @@ async def test_multi_init_logs_reconnect_after_first(
     assert err.count("[init]") == 1, f"expected one [init], got:\n{err}"
     assert err.count("[reconnect]") == 2, f"expected two [reconnect], got:\n{err}"
     assert err.index("[init]") < err.index("[reconnect]")
+    assert prompt_calls == ["test"], f"expected one log_prompt call, got: {prompt_calls}"
     assert exit_code == 0
