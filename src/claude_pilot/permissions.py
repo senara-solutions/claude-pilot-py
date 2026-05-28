@@ -22,7 +22,7 @@ from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 from claude_agent_sdk.types import ToolPermissionContext
 
 from .guardrails import SessionGuardrails
-from .policy import Policy, evaluate, load_policy
+from .policy import evaluate, load_policy
 from .tier1 import is_tier1_auto_approve
 from .transport import invoke_command
 from .types import (

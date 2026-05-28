@@ -1,10 +1,18 @@
 """Tests for the deterministic rule-file evaluator (mika#1192)."""
 
 from __future__ import annotations
+
 from pathlib import Path
+
 import pytest
+
 from claude_pilot.policy import (
-    Policy, PolicyDecision, PolicyDefault, PolicyRule, evaluate, load_policy,
+    Policy,
+    PolicyDecision,
+    PolicyDefault,
+    PolicyRule,
+    evaluate,
+    load_policy,
 )
 
 
@@ -161,6 +169,7 @@ class TestEvaluateRules:
 def test_no_relay_config_graceful() -> None:
     """Verify _load_config returns None when config file does not exist."""
     import tempfile
+
     from claude_pilot.cli import _load_config
     with tempfile.TemporaryDirectory() as d:
         result = _load_config(Path(d), None)
