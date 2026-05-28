@@ -105,6 +105,21 @@ def log_guardrail(type_: str, detail: str) -> None:
     _log(f"\n{ORANGE}[guardrail]{RESET} {BOLD}{type_}{RESET}: {detail}")
 
 
+def log_policy_allow(tool_name: str, detail: str, rule_id: str | None) -> None:
+    tag = f" [{rule_id}]" if rule_id else ""
+    _log(f"{GREEN}[policy:allow]{RESET} {BOLD}{tool_name}{RESET}: {detail}{tag}")
+
+
+def log_policy_deny(tool_name: str, detail: str, rule_id: str | None) -> None:
+    tag = f" [{rule_id}]" if rule_id else ""
+    _log(f"{RED}[policy:deny]{RESET} {BOLD}{tool_name}{RESET}: {detail}{tag}")
+
+
+def log_policy_escalate(tool_name: str, detail: str, rule_id: str | None) -> None:
+    tag = f" [{rule_id}]" if rule_id else ""
+    _log(f"{YELLOW}[policy:escalate]{RESET} {BOLD}{tool_name}{RESET}: {detail}{tag}")
+
+
 def log_turn_summary(turn: int, summary: str) -> None:
     """Per-turn marker for diagnostically silent turns (cpp#10).
 

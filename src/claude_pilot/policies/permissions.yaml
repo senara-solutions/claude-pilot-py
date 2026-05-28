@@ -1,0 +1,42 @@
+# -- claude-pilot permission policy ----------------------------------------
+#
+# Schema:
+#   rules:          Ordered list of rules. First match wins.
+#     - id:         Unique identifier for audit trail
+#       tool:       Tool name to match (case-sensitive, e.g. "Bash", "Skill")
+#       pattern:    Regex matched against the tool's primary input field:
+#                     Bash  -> command
+#                     Write/Edit/Read -> file_path
+#                     Glob/Grep -> pattern
+#                     Skill -> skill name
+#                     Other -> str(tool_input)
+#       decision:   "allow" | "deny" | "escalate"
+#       reason:     Human-readable explanation (shown in logs, notify payload)
+#
+#   default:        Fallback when no rule matches.
+#     decision:     "allow" | "deny" | "escalate"
+#     reason:       Human-readable explanation
+#
+# Notes:
+#   - Extra fields are allowed for forward-compatibility (ignored by current
+#     evaluator).
+#   - Real rules will be derived from audit data (Change 4). These two
+#     are schema-illustrative placeholders.
+# --------------------------------------------------------------------------
+
+rules:
+  - id: gh-issue-create-deny
+    tool: Bash
+    pattern: "gh\\s+issue\\s+create"
+    decision: deny
+    reason: "gh issue create is handled by mika-issue skill -- direct CLI use denied"
+
+  - id: mika-ask-non-platform-agent
+    tool: Skill
+    pattern: "^mika-ask$"
+    decision: escalate
+    reason: "mika-ask targets external agents -- escalate for operator review"
+
+default:
+  decision: escalate
+  reason: "no matching policy rule -- escalating to operator"

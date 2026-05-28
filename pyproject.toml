@@ -9,6 +9,7 @@ authors = [{ name = "Senara Solutions" }]
 dependencies = [
   "claude-agent-sdk==0.1.59",
   "pydantic>=2.6,<3",
+  "pyyaml>=6.0,<7",
   "python-dotenv>=1.0",
 ]
 
@@ -21,6 +22,7 @@ dev = [
   "pytest-asyncio>=0.23",
   "ruff>=0.5",
   "mypy>=1.10",
+  "types-PyYAML>=6.0",
 ]
 
 [build-system]
@@ -37,10 +39,10 @@ target-version = "py311"
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
 ignore = [
-  "E501",  # line length handled by formatter; we don't enforce a hard cap
-  "SIM103", # "return the condition directly" — explicit branches read cleaner in tier1 rules
-  "SIM105", # `try/except/pass` — explicit form is fine for best-effort cleanup
-  "SIM108", # ternary replacement not always clearer
+  "E501",
+  "SIM103",
+  "SIM105",
+  "SIM108",
 ]
 
 [tool.mypy]

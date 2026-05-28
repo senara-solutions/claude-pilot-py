@@ -9,16 +9,20 @@ response to SDK PermissionResult.
 from __future__ import annotations
 
 import json
+import logging
+import os
 import re
 import sys
 import time
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any
 
 from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 from claude_agent_sdk.types import ToolPermissionContext
 
 from .guardrails import SessionGuardrails
+from .policy import evaluate, load_policy
 from .tier1 import is_tier1_auto_approve
 from .transport import invoke_command
 from .types import (
@@ -34,6 +38,9 @@ from .ui import (
     log_denied,
     log_escalate,
     log_fallback,
+    log_policy_allow,
+    log_policy_deny,
+    log_policy_escalate,
     log_question,
     log_question_escalate,
     log_relay_recv,
@@ -43,11 +50,20 @@ from .ui import (
     log_tool_request,
 )
 
+_policy_logger = logging.getLogger(__name__)
+
 PermissionResult = PermissionResultAllow | PermissionResultDeny
 CanUseTool = Callable[
     [str, dict[str, Any], ToolPermissionContext],
     Awaitable[PermissionResult],
 ]
+
+
+def _fire_notify(tool_name: str, detail: str, reason: str) -> None:
+    """Best-effort operator notification on escalation via ``mika notify``."""
+    from .notify import notify_escalation
+
+    notify_escalation(f"{tool_name}: {detail}: {reason}")
 
 
 def create_permission_handler(
@@ -58,7 +74,12 @@ def create_permission_handler(
     cwd: str,
     guardrails: SessionGuardrails | None = None,
     task_id: str | None = None,
+    policy_path: Path | None = None,
 ) -> CanUseTool:
+    # Load policy once at handler creation time (cached for session).
+    policy = load_policy(policy_path)
+    policy_enabled = os.environ.get("MIKA_PILOT_POLICY_DISABLED", "").strip() != "1"
+
     async def handler(
         tool_name: str,
         tool_input: dict[str, Any],
@@ -76,6 +97,24 @@ def create_permission_handler(
         if auto_answer is not None:
             log_tool(tool_name, _summarize_input(tool_name, tool_input), "AUTO")
             return _map_response(tool_name, tool_input, auto_answer)
+
+        # Tier 2: deterministic policy-file lookup (mika#1192)
+        if policy_enabled:
+            pd = evaluate(policy, tool_name, tool_input)
+            detail = _summarize_input(tool_name, tool_input)
+            if pd.decision == "allow":
+                log_policy_allow(tool_name, detail, pd.rule_id)
+                return PermissionResultAllow(updated_input=tool_input)
+            if pd.decision == "deny":
+                log_policy_deny(tool_name, detail, pd.rule_id)
+                return PermissionResultDeny(message=pd.reason, interrupt=False)
+            # escalate: best-effort notify, then deny
+            log_policy_escalate(tool_name, detail, pd.rule_id)
+            _fire_notify(tool_name, detail, pd.reason)
+            return PermissionResultDeny(message=pd.reason, interrupt=False)
+
+        # TODO(mika#1193 Phase C): remove relay block below once policy has soaked ≥7 days.
+        # The relay path is only reachable when MIKA_PILOT_POLICY_DISABLED=1 (emergency rollback).
 
         # No relay → interactive fallback
         if not relay or config is None:
