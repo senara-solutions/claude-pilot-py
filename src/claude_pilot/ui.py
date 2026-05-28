@@ -119,9 +119,17 @@ def log_policy_deny(tool_name: str, detail: str, rule_id: str | None) -> None:
     _log(f"{RED}[policy:deny]{RESET} {BOLD}{tool_name}{RESET}: {detail}{tag}")
 
 
-def log_policy_escalate(tool_name: str, detail: str, rule_id: str | None) -> None:
+def log_policy_deny_with_notify(tool_name: str, detail: str, rule_id: str | None) -> None:
+    """Log a policy decision of ``escalate`` (wire-format) = deny-with-notify.
+
+    Renamed from ``log_policy_escalate`` in cpp#20/#21: the runtime semantics
+    post-joint-2 are "halt the pilot loop + best-effort operator notify" --
+    not a relay-to-operator-for-decision escalation. The wire-format keyword
+    stays ``escalate`` for back-compat; the source symbol reads under the
+    correct name.
+    """
     tag = f" [{rule_id}]" if rule_id else ""
-    _log(f"{YELLOW}[policy:escalate]{RESET} {BOLD}{tool_name}{RESET}: {detail}{tag}")
+    _log(f"{YELLOW}[policy:deny_with_notify]{RESET} {BOLD}{tool_name}{RESET}: {detail}{tag}")
 
 
 def log_turn_summary(turn: int, summary: str) -> None:

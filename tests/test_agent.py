@@ -361,3 +361,69 @@ async def test_multi_init_logs_reconnect_after_first(
     assert err.index("[init]") < err.index("[reconnect]")
     assert prompt_calls == ["test"], f"expected one log_prompt call, got: {prompt_calls}"
     assert exit_code == 0
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# cpp#20 joint 2 synthetic-emit regression test
+# ────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_agent_emits_synthetic_terminal_on_silent_stream_end(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """cpp#20 joint 2 safety contract: when the SDK message stream ends
+    without yielding a ResultMessage (the Case-B failure mode introduced
+    by ``PermissionResultDeny(interrupt=True)`` at the can_use_tool
+    boundary), ``run_agent`` MUST emit a synthetic terminal ResultJson
+    to stdout so dispatch-lib's ``grep -m1 '^{' | jq -r '.status'``
+    parsing always sees a non-success status. Without this guard the
+    pilot would exit silently with empty stdout — the seam joint 2's
+    safety story rests on.
+
+    Mock the SDK client to yield only init + assistant messages (no
+    ResultMessage), simulating the CLI closing its stdio pipe cleanly
+    after the SDK relays interrupt=True. Capture stdout, parse the
+    first ``^{`` line, assert it has status="error" and the
+    cpp#20-defined subtype.
+    """
+    import json
+
+    messages: list[Any] = [
+        _init(),
+        _assistant([TextBlock(text="going to run a denied tool now")], "msg1"),
+        # No ResultMessage — stream just ends. This is the Case-B trigger.
+    ]
+
+    _install_fake_client(monkeypatch, messages)
+    guardrails = SessionGuardrails(_config())
+
+    exit_code = await run_agent(
+        prompt="test",
+        cwd=".",
+        verbose=False,
+        task_id="task_synthetic_test",
+        permission_handler=_noop_permission,
+        guardrails=guardrails,
+    )
+
+    captured = capsys.readouterr()
+    # Exactly one terminal JSON line on stdout — no double-emit, no silent exit.
+    json_lines = [line for line in captured.out.splitlines() if line.startswith("{")]
+    assert len(json_lines) == 1, (
+        f"expected exactly one terminal JSON line, got {len(json_lines)}:\n{captured.out!r}"
+    )
+
+    payload = json.loads(json_lines[0])
+    # dispatch-lib parses .status with `jq -r '.status // empty'` — assert the
+    # value is a non-success that maps cleanly.
+    assert payload["status"] == "error", (
+        f"expected status=error for silent stream end, got {payload!r}"
+    )
+    assert payload["subtype"] == "stream_ended_without_result", (
+        f"expected subtype=stream_ended_without_result, got {payload!r}"
+    )
+    assert payload["task_id"] == "task_synthetic_test"
+    # exit code reflects the silent-stream-end as a non-success run.
+    assert exit_code == 1

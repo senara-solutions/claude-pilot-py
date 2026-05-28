@@ -11,6 +11,8 @@
 #                     Skill -> skill name
 #                     Other -> str(tool_input)
 #       decision:   "allow" | "deny" | "escalate"
+#                     "escalate" returns deny + best-effort operator notify
+#                     (deny-with-notify; see permissions.py handler dispatch).
 #       reason:     Human-readable explanation (shown in logs, notify payload)
 #
 #   default:        Fallback when no rule matches.
@@ -18,25 +20,111 @@
 #     reason:       Human-readable explanation
 #
 # Notes:
-#   - Extra fields are allowed for forward-compatibility (ignored by current
-#     evaluator).
-#   - Real rules will be derived from audit data (Change 4). These two
-#     are schema-illustrative placeholders.
+#   - Tier 1 fast-path (read-only file ops, safe binaries) is consulted before
+#     this file via permissions.py::is_tier1_auto_approve. Anything that takes
+#     that path is auto-allowed without entering the rules list.
+#   - Operator override: set MIKA_PILOT_POLICY_PATH=<path> to point at a
+#     different file. Used for temporary overlays (e.g. widened groom-phase
+#     allowlists) without rebuilding cpp. The override remains as escape
+#     hatch; this bundled file is the production default.
+#   - Rule set below was derived from groom-phase pilot evidence (mika
+#     dispatch-lib `_run_claude_pilot` calls captured 2026-05-28). Dev-pilot
+#     phase Bash footprint (cargo/uv/npm/file-tools) is not yet enumerated --
+#     those tool calls will hit `default: deny` and halt the pilot via
+#     joint 2's interrupt=True semantics. Extend the rule set as dev-pilot
+#     evidence is captured.
 # --------------------------------------------------------------------------
 
 rules:
+  # ---- Read-only repo orientation ----
+  # Common pre-work Bash commands that pilots use to understand the codebase
+  # before making changes. Confirmed in mika#1253's pre-wedge pilot log.
+
+  - id: bash-find
+    tool: Bash
+    pattern: "^find\\s"
+    decision: allow
+    reason: "find for repo orientation"
+
+  - id: bash-grep
+    tool: Bash
+    pattern: "^grep\\s|\\sgrep\\s"
+    decision: allow
+    reason: "grep for source-code research"
+
+  - id: bash-jq
+    tool: Bash
+    pattern: "^(for\\s.*do\\s+.*\\s)?jq\\s|;\\s*jq\\s"
+    decision: allow
+    reason: "jq for skill-manifest and JSON inspection"
+
+  - id: bash-for-loop-orientation
+    tool: Bash
+    pattern: "^for\\s+\\w+\\s+in\\s.*;\\s*do\\s"
+    decision: allow
+    reason: "shell-for loops for batch orientation queries"
+
+  - id: bash-cat-heredoc-tmp
+    tool: Bash
+    pattern: "^cat\\s+>\\s+/tmp/.*<<\\s*'?EOF'?"
+    decision: allow
+    reason: "heredoc to /tmp for helper scripts (groom-phase)"
+
+  # ---- Git operations ----
+  # The slash-command-driven groom phase requires git read + plan-doc commit
+  # + push. Read-only ops are always safe; commit/push are gated by the
+  # slash command's own state machine, not by policy.
+
+  - id: bash-git-readonly
+    tool: Bash
+    pattern: "^git\\s+(status|log|diff|show|branch|rev-parse|fetch|ls-remote|worktree)"
+    decision: allow
+    reason: "git read-only operations"
+
+  - id: bash-git-stage-commit
+    tool: Bash
+    pattern: "^git\\s+(add|commit)"
+    decision: allow
+    reason: "git add + git commit (plan-authoring phase)"
+
+  - id: bash-git-push
+    tool: Bash
+    pattern: "^git\\s+push(\\s|$)"
+    decision: allow
+    reason: "git push (groom-phase plan publication)"
+
+  # ---- GitHub CLI read-only ops ----
+
+  - id: bash-gh-issue-read
+    tool: Bash
+    pattern: "^gh\\s+issue\\s+(view|list)"
+    decision: allow
+    reason: "gh issue view/list (ticket grounding)"
+
+  - id: bash-gh-pr-read
+    tool: Bash
+    pattern: "^gh\\s+pr\\s+(view|list|diff|checks)"
+    decision: allow
+    reason: "gh pr view/list/diff/checks (PR grounding)"
+
+  # ---- GitHub CLI write -- gated ----
+  # gh issue create is handled by the mika-issue skill, which routes
+  # through agent-tier authority. Direct CLI use bypasses that.
+
   - id: gh-issue-create-deny
     tool: Bash
     pattern: "gh\\s+issue\\s+create"
     decision: deny
     reason: "gh issue create is handled by mika-issue skill -- direct CLI use denied"
 
+  # ---- Skill tool -- non-platform agent escalation ----
+
   - id: mika-ask-non-platform-agent
     tool: Skill
     pattern: "^mika-ask$"
     decision: escalate
-    reason: "mika-ask targets external agents -- escalate for operator review"
+    reason: "mika-ask targets external agents -- escalate (deny + notify) for operator review"
 
 default:
-  decision: escalate
-  reason: "no matching policy rule -- escalating to operator"
+  decision: deny
+  reason: "no matching policy rule -- denied by default (production posture; widen rules to allow new tool footprints)"
