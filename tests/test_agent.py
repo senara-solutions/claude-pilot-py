@@ -288,3 +288,63 @@ def test_text_of_returns_none_for_non_text_block() -> None:
     """Non-text blocks (ThinkingBlock, ToolUseBlock) must return None."""
     assert agent_module._text_of(ThinkingBlock(thinking="x", signature="sig")) is None
     assert agent_module._text_of(ToolUseBlock(id="t1", name="Bash", input={})) is None
+
+
+@pytest.mark.asyncio
+async def test_single_init_no_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Regression guard for cpp#7: a normal session with one init must emit
+    exactly one `[init]` line and zero `[reconnect]` lines."""
+    messages: list[Any] = [_init(), _result()]
+
+    _install_fake_client(monkeypatch, messages)
+    guardrails = SessionGuardrails(_config())
+
+    exit_code = await run_agent(
+        prompt="test",
+        cwd=".",
+        verbose=False,
+        task_id=None,
+        permission_handler=_noop_permission,
+        guardrails=guardrails,
+    )
+
+    err = capsys.readouterr().err
+    assert err.count("[init]") == 1
+    assert err.count("[reconnect]") == 0
+    assert exit_code == 0
+
+
+@pytest.mark.asyncio
+async def test_multi_init_logs_reconnect_after_first(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """cpp#7: when the SDK emits multiple `SystemMessage(subtype="init")`
+    events for a single session (transient reconnects), only the first should
+    log `[init]` + `[prompt]`. Subsequent inits log `[reconnect]` instead so
+    audits don't see fake re-dispatches.
+
+    Mirrors the original incident shape: three rapid inits in a row.
+    """
+    messages: list[Any] = [_init(), _init(), _init(), _result()]
+
+    _install_fake_client(monkeypatch, messages)
+    guardrails = SessionGuardrails(_config())
+
+    exit_code = await run_agent(
+        prompt="test",
+        cwd=".",
+        verbose=False,
+        task_id=None,
+        permission_handler=_noop_permission,
+        guardrails=guardrails,
+    )
+
+    err = capsys.readouterr().err
+    assert err.count("[init]") == 1, f"expected one [init], got:\n{err}"
+    assert err.count("[reconnect]") == 2, f"expected two [reconnect], got:\n{err}"
+    assert err.index("[init]") < err.index("[reconnect]")
+    assert exit_code == 0
