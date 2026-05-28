@@ -28,6 +28,7 @@ from .ui import (
     log_guardrail_config,
     log_init,
     log_prompt,
+    log_reconnect,
     log_text,
     log_turn_summary,
 )
@@ -47,6 +48,7 @@ async def run_agent(
     """Run the agent session. Returns the intended process exit code."""
     start_time = time.monotonic()
     session_id: str | None = None
+    seen_init: bool = False
     config = guardrails.config
 
     log_guardrail_config(config)
@@ -94,8 +96,12 @@ async def run_agent(
                 if isinstance(message, SystemMessage) and message.subtype == "init":
                     session_id = _extract_session_id(message)
                     model = _extract_model(message)
-                    log_init(session_id or "", model or "unknown", task_id)
-                    log_prompt(prompt)
+                    if not seen_init:
+                        log_init(session_id or "", model or "unknown", task_id)
+                        log_prompt(prompt)
+                        seen_init = True
+                    else:
+                        log_reconnect(session_id or "", model or "unknown")
                     continue
 
                 if isinstance(message, AssistantMessage):

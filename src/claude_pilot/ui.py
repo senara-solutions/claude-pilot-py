@@ -25,6 +25,10 @@ def log_init(session_id: str, model: str, task_id: str | None = None) -> None:
     _log(f"{DIM}[init]{RESET} Session {session_id[:8]}, model {model}{task_str}")
 
 
+def log_reconnect(session_id: str, model: str) -> None:
+    _log(f"{DIM}[reconnect]{RESET} Session {session_id[:8]}, model {model}")
+
+
 def log_tool(tool_name: str, detail: str, decision: str | None = None) -> None:
     if decision:
         color = GREEN if decision == "ALLOW" else RED if decision == "DENY" else YELLOW
