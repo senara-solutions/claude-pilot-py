@@ -271,12 +271,22 @@ def _content_blocks(message: AssistantMessage) -> list[Any]:
 
 
 def _text_of(block: Any) -> str | None:
+    """Extract text from a content block.
+
+    Mirrors `guardrails._block_type` dual-shape handling: SDK dataclass
+    instances (TextBlock, etc.) do NOT carry a `type` attribute — the
+    wire-format `type` field is consumed by the SDK parser. Fall back on
+    class name for dataclass-shaped blocks (cpp#12).
+    """
     if isinstance(block, dict):
         if block.get("type") == "text":
             text = block.get("text")
             return text if isinstance(text, str) else None
         return None
-    if getattr(block, "type", None) == "text":
+    t = getattr(block, "type", None)
+    if not isinstance(t, str) and type(block).__name__ == "TextBlock":
+        t = "text"
+    if t == "text":
         text = getattr(block, "text", None)
         return text if isinstance(text, str) else None
     return None

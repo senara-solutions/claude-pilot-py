@@ -263,3 +263,28 @@ async def test_text_only_final_turn_emits_no_marker(
     assert "[turn 1]" not in err
     assert "no observable output" not in err
     assert "thinking-only" not in err
+
+
+# ---- cpp#12: _text_of must handle SDK dataclass TextBlock (no `type` attr) ----
+
+
+def test_text_of_returns_text_for_sdk_dataclass_textblock() -> None:
+    """SDK dataclass `TextBlock` instances do not carry a `type` attribute —
+    the wire-format `type` is consumed by the parser. `_text_of` must fall
+    back on class name so `log_text` fires for production text-emitting turns.
+    Regression for cpp#12 (production pilot logs emitting zero [text] lines).
+    """
+    block = TextBlock(text="hello world")
+    assert agent_module._text_of(block) == "hello world"
+
+
+def test_text_of_returns_text_for_dict_shaped_block() -> None:
+    """Dict-shaped blocks (legacy wire-format) must continue to work."""
+    block = {"type": "text", "text": "hello world"}
+    assert agent_module._text_of(block) == "hello world"
+
+
+def test_text_of_returns_none_for_non_text_block() -> None:
+    """Non-text blocks (ThinkingBlock, ToolUseBlock) must return None."""
+    assert agent_module._text_of(ThinkingBlock(thinking="x", signature="sig")) is None
+    assert agent_module._text_of(ToolUseBlock(id="t1", name="Bash", input={})) is None
