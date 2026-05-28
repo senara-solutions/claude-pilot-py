@@ -532,9 +532,32 @@ class TestTier3OutputRedirectCarveout:
     def test_tier3_blocks_append_redirect_file(self) -> None:
         assert is_tier3_dangerous("mika ask >> /tmp/exfil") is True
 
-    def test_tier3_blocks_numeric_fd_to_file(self) -> None:
-        # accepted-deny: 2>/dev/null is rejected
-        assert is_tier3_dangerous("mika ask 2>/dev/null") is True
+    def test_tier3_allows_fd_to_devnull_silencing(self) -> None:
+        # Contract update (mika#1327 follow-up): the universal stderr/stdout
+        # silencing idiom `\d>/dev/null` is carved out from the fd-to-file
+        # deny. /dev/null is a special device that discards writes -- no
+        # exfiltration, no file overwrite, no surface for abuse. Generic
+        # `>file` and `2>somefile` continue to deny (see the two tests
+        # below). Surfaced when cpp#20's default-deny + interrupt=True made
+        # the pre-existing Tier 1 false-positive visible: mika#1327
+        # dev-pilot dispatch halted on `ls /path/ 2>/dev/null`.
+        assert is_tier3_dangerous("mika ask 2>/dev/null") is False
+        assert is_tier3_dangerous("mika ask 1>/dev/null") is False
+        assert is_tier3_dangerous("ls /tmp/ 2>/dev/null") is False
+
+    def test_tier3_still_blocks_fd_to_arbitrary_file(self) -> None:
+        # Carveout is narrow: only /dev/null is the safe target. Writing
+        # stderr (or any fd) to an arbitrary pathname remains a deny.
+        assert is_tier3_dangerous("mika ask 2>/tmp/exfil") is True
+        assert is_tier3_dangerous("mika ask 2>~/.bashrc") is True
+        assert is_tier3_dangerous("mika ask 1>/etc/passwd") is True
+
+    def test_tier3_carveout_does_not_loosen_devnull_lookalikes(self) -> None:
+        # The carveout regex `\b\d+>/dev/null\b` is anchored. Adversarial
+        # lookalikes that include /dev/null as a path component but redirect
+        # elsewhere remain blocked.
+        assert is_tier3_dangerous("mika ask 2>/dev/nulla") is True
+        assert is_tier3_dangerous("mika ask 2>/dev/null/etc/passwd") is True
 
     def test_tier3_allows_fd_dup_stderr_to_stdout(self) -> None:
         assert is_tier3_dangerous("mika ask 2>&1") is False
