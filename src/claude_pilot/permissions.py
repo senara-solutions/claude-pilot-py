@@ -40,7 +40,7 @@ from .ui import (
     log_fallback,
     log_policy_allow,
     log_policy_deny,
-    log_policy_escalate,
+    log_policy_deny_with_notify,
     log_question,
     log_question_escalate,
     log_relay_recv,
@@ -60,7 +60,13 @@ CanUseTool = Callable[
 
 
 def _fire_notify(tool_name: str, detail: str, reason: str) -> None:
-    """Best-effort operator notification on escalation via ``mika notify``."""
+    """Best-effort operator notification on deny-with-notify via ``mika notify``.
+
+    Wire-format keeps the legacy ``escalate`` decision string for back-compat
+    with existing operator-authored permissions.yaml overlays; the runtime
+    semantics post-cpp#20 joint 2 are deny-with-notify (no relay roundtrip,
+    pilot loop halts via ``interrupt=True``).
+    """
     from .notify import notify_escalation
 
     notify_escalation(f"{tool_name}: {detail}: {reason}")
@@ -98,7 +104,13 @@ def create_permission_handler(
             log_tool(tool_name, _summarize_input(tool_name, tool_input), "AUTO")
             return _map_response(tool_name, tool_input, auto_answer)
 
-        # Tier 2: deterministic policy-file lookup (mika#1192)
+        # Tier 2: deterministic policy-file lookup (mika#1192).
+        # cpp#20 joint 2: denial paths return PermissionResultDeny(interrupt=True)
+        # so the SDK aborts the agent loop instead of surfacing the denial as a
+        # tool_result error the LLM can fabricate around. The pilot exits
+        # honestly; downstream parsers (mika dispatch-lib `_run_claude_pilot`)
+        # see a clean terminal ResultJson with status != "success" via the
+        # synthetic-emit guard in agent.py.
         if policy_enabled:
             pd = evaluate(policy, tool_name, tool_input)
             detail = _summarize_input(tool_name, tool_input)
@@ -107,13 +119,17 @@ def create_permission_handler(
                 return PermissionResultAllow(updated_input=tool_input)
             if pd.decision == "deny":
                 log_policy_deny(tool_name, detail, pd.rule_id)
-                return PermissionResultDeny(message=pd.reason, interrupt=False)
-            # escalate: best-effort notify, then deny
-            log_policy_escalate(tool_name, detail, pd.rule_id)
+                return PermissionResultDeny(message=pd.reason, interrupt=True)
+            # Wire-format `escalate` = deny-with-notify: best-effort operator
+            # notify + halt the pilot loop. Wire keyword preserved for
+            # back-compat with existing operator overlays; runtime semantics
+            # post-cpp#20 joint 2 are identical to `deny` plus the notify
+            # side-effect (cpp#21 rename is source-only).
+            log_policy_deny_with_notify(tool_name, detail, pd.rule_id)
             _fire_notify(tool_name, detail, pd.reason)
-            return PermissionResultDeny(message=pd.reason, interrupt=False)
+            return PermissionResultDeny(message=pd.reason, interrupt=True)
 
-        # TODO(mika#1193 Phase C): remove relay block below once policy has soaked ≥7 days.
+        # TODO(mika#1193 Phase C): remove relay block below once policy has soaked >= 7 days.
         # The relay path is only reachable when MIKA_PILOT_POLICY_DISABLED=1 (emergency rollback).
 
         # No relay → interactive fallback

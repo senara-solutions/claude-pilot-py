@@ -9,7 +9,13 @@ for events that are equivalent to TIER 1.5 in
 
 from __future__ import annotations
 
-from claude_pilot.permissions import try_tier_1_5_auto_answer
+import asyncio
+from pathlib import Path
+
+from claude_agent_sdk import PermissionResultDeny
+from claude_agent_sdk.types import ToolPermissionContext
+
+from claude_pilot.permissions import create_permission_handler, try_tier_1_5_auto_answer
 from claude_pilot.types import PilotResponseAnswer
 
 
@@ -125,3 +131,122 @@ def test_missing_question_key_returns_none() -> None:
         {"questions": [{"options": ["a", "b"]}]},
     )
     assert result is None
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# cpp#20 joint 2: handler returns interrupt=True on policy denial
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def _mock_ctx() -> ToolPermissionContext:
+    return ToolPermissionContext(
+        signal=None,
+        suggestions=[],
+        tool_use_id="tool_test",
+        agent_id=None,
+    )
+
+
+def test_handler_returns_interrupt_true_on_default_deny() -> None:
+    """cpp#20 joint 2 end-to-end: handler under fail-closed policy
+    (missing file → empty Policy → default-deny) returns
+    PermissionResultDeny(interrupt=True). This is the contract
+    dispatch-lib relies on for the pilot loop to halt honestly
+    instead of continuing past a silent denial.
+    """
+    handler = create_permission_handler(
+        config=None,
+        relay=False,
+        verbose=False,
+        cwd="/tmp",
+        policy_path=Path("/nonexistent/policy.yaml"),
+    )
+    result = asyncio.run(handler("Bash", {"command": "rm -rf /"}, _mock_ctx()))
+    assert isinstance(result, PermissionResultDeny), (
+        f"expected PermissionResultDeny, got {type(result)}: {result!r}"
+    )
+    assert result.interrupt is True, (
+        f"expected interrupt=True for cpp#20 joint 2 contract, got {result!r}"
+    )
+
+
+def test_handler_returns_interrupt_true_on_rule_deny(tmp_path: Path) -> None:
+    """An explicit rule-based deny must also return interrupt=True --
+    not just the default-deny path. Pins permissions.py deny branch
+    (current source line 110).
+
+    Uses ``curl`` because Tier 1 fast-path auto-approves common safe
+    binaries (echo, awk, find, etc.); we need a command that misses
+    Tier 1 so the request reaches the policy evaluator.
+    """
+    policy_file = tmp_path / "rule_deny.yaml"
+    policy_file.write_text(
+        "rules:\n"
+        "  - id: deny-curl\n"
+        "    tool: Bash\n"
+        "    pattern: '^curl\\s'\n"
+        "    decision: deny\n"
+        "    reason: rule-based test deny\n"
+        "default:\n"
+        "  decision: allow\n"
+        "  reason: default allow (test fixture)\n"
+    )
+    handler = create_permission_handler(
+        config=None,
+        relay=False,
+        verbose=False,
+        cwd="/tmp",
+        policy_path=policy_file,
+    )
+    result = asyncio.run(handler("Bash", {"command": "curl https://example.com"}, _mock_ctx()))
+    assert isinstance(result, PermissionResultDeny)
+    assert result.interrupt is True
+    assert result.message == "rule-based test deny"
+
+
+def test_handler_returns_interrupt_true_on_escalate_decision(tmp_path: Path) -> None:
+    """The wire-format ``escalate`` decision (renamed in source to
+    deny-with-notify) also returns interrupt=True. Pins
+    permissions.py:114 alongside the deny branch.
+    """
+    policy_file = tmp_path / "escalate.yaml"
+    policy_file.write_text(
+        "rules:\n"
+        "  - id: escalate-skill\n"
+        "    tool: Skill\n"
+        "    pattern: '^test-target$'\n"
+        "    decision: escalate\n"
+        "    reason: rule-based test escalate\n"
+        "default:\n"
+        "  decision: allow\n"
+        "  reason: default allow (test fixture)\n"
+    )
+    handler = create_permission_handler(
+        config=None,
+        relay=False,
+        verbose=False,
+        cwd="/tmp",
+        policy_path=policy_file,
+    )
+    # Use monkeypatched notify so the test does not actually call mika notify.
+    from claude_pilot import permissions as permissions_module
+
+    fired: list[tuple[str, str, str]] = []
+
+    def _fake_notify(tool_name: str, detail: str, reason: str) -> None:
+        fired.append((tool_name, detail, reason))
+
+    original = permissions_module._fire_notify
+    permissions_module._fire_notify = _fake_notify  # type: ignore[assignment]
+    try:
+        result = asyncio.run(handler("Skill", {"skill": "test-target"}, _mock_ctx()))
+    finally:
+        permissions_module._fire_notify = original  # type: ignore[assignment]
+
+    assert isinstance(result, PermissionResultDeny)
+    assert result.interrupt is True, (
+        "escalate (deny-with-notify) must also halt the loop"
+    )
+    assert result.message == "rule-based test escalate"
+    # Notify fired exactly once on this path.
+    assert len(fired) == 1

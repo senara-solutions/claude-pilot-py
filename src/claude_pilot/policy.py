@@ -3,7 +3,9 @@
 Replaces the relay LLM call for tier2 decisions (Phase B of mika#1188).
 Rules are matched in order; first hit wins. If no rule matches, the
 policy default applies.  Graceful degradation: missing file or parse
-error -> empty rules -> default escalate.
+error -> empty rules -> default deny (fail-closed; cpp#20 joint 1
+hardens the prior default-escalate posture into default-deny on every
+fail-closed path).
 """
 
 from __future__ import annotations
@@ -59,8 +61,8 @@ class PolicyDefault(BaseModel):
 
     model_config = ConfigDict(extra="allow")
 
-    decision: str = "escalate"
-    reason: str = "no matching rule — escalating to operator"
+    decision: str = "deny"
+    reason: str = "no matching rule -- denied by default (fail-closed)"
 
     @field_validator("decision")
     @classmethod
@@ -143,7 +145,8 @@ def load_policy(path: Path | None = None) -> Policy:
     3. Bundled default at ``policies/permissions.yaml``
 
     On any error (missing file, parse failure, validation failure) the
-    function returns a safe fallback: empty rules with ``default: escalate``.
+    function returns a safe fallback: empty rules with ``default: deny``
+    (fail-closed; cpp#20 joint 1).
     """
     resolved: Path | None = path
 
@@ -156,32 +159,32 @@ def load_policy(path: Path | None = None) -> Policy:
         resolved = _load_bundled_policy_path()
 
     if resolved is None:
-        logger.warning("policy: no policy file found — using default escalate")
+        logger.warning("policy: no policy file found — using default deny")
         return Policy()
 
     try:
         raw = resolved.read_text(encoding="utf-8")
     except FileNotFoundError:
-        logger.warning("policy: file not found %s — using default escalate", resolved)
+        logger.warning("policy: file not found %s — using default deny", resolved)
         return Policy()
     except OSError as err:
-        logger.warning("policy: cannot read %s: %s — using default escalate", resolved, err)
+        logger.warning("policy: cannot read %s: %s — using default deny", resolved, err)
         return Policy()
 
     try:
         data = yaml.safe_load(raw)
     except yaml.YAMLError as err:
-        logger.warning("policy: malformed YAML in %s: %s — using default escalate", resolved, err)
+        logger.warning("policy: malformed YAML in %s: %s — using default deny", resolved, err)
         return Policy()
 
     if not isinstance(data, dict):
-        logger.warning("policy: expected mapping in %s — using default escalate", resolved)
+        logger.warning("policy: expected mapping in %s — using default deny", resolved)
         return Policy()
 
     try:
         return Policy.model_validate(data)
     except Exception as err:
-        logger.warning("policy: validation error in %s: %s — using default escalate", resolved, err)
+        logger.warning("policy: validation error in %s: %s — using default deny", resolved, err)
         return Policy()
 
 

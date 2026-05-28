@@ -63,6 +63,14 @@ async def run_agent(
     )
 
     exit_code = 0
+    # cpp#20 joint 2 synthetic-emit guard: flips True after any in-loop
+    # terminal _emit_result call (guardrail trip or ResultMessage). Post-loop
+    # check below uses this to decide whether to emit a synthetic terminal
+    # ResultJson when the SDK stream ends without a ResultMessage -- the
+    # Case-B failure mode introduced by PermissionResultDeny(interrupt=True)
+    # at the can_use_tool boundary. Mutual exclusion proof + architect
+    # verdict: cpp#20 body, "Friend-Claude review convergence" section.
+    emitted_terminal = False
 
     async with ClaudeSDKClient(options=options) as client:
         await client.query(prompt)
@@ -86,6 +94,7 @@ async def run_agent(
                             termination_reason=reason.detail,
                         )
                     )
+                    emitted_terminal = True  # cpp#20 joint 2 mutual-exclusion guard (Site 1)
                     log_guardrail(reason.guardrail, reason.detail)
                     try:
                         await client.interrupt()
@@ -185,6 +194,7 @@ async def run_agent(
                         termination_reason=termination_reason,
                     )
                     _emit_result(result)
+                    emitted_terminal = True  # cpp#20 joint 2 mutual-exclusion guard (Site 2)
 
                     # mika#1189: side-channel handoff to the gateway
                     # orchestrator inbox, alongside the existing
@@ -209,6 +219,38 @@ async def run_agent(
         finally:
             guardrail_watcher.cancel()
             guardrails.dispose()
+
+    # cpp#20 joint 2 synthetic terminal emit. Fires only when the SDK message
+    # stream ended cleanly without yielding either a guardrail trip (Site 1)
+    # or a ResultMessage (Site 2). Triggered by:
+    #   * `PermissionResultDeny(interrupt=True)` at the can_use_tool boundary
+    #     causing the Claude Code CLI to close its stdio pipe without a
+    #     terminal ResultMessage (the Case-B failure mode the friend-Claude
+    #     review converged on; architect verdict READY).
+    #   * Transport drop / clean upstream close for any other reason.
+    # Without this guard cpp would exit silently with empty stdout, and
+    # dispatch-lib's `jq -r '.status // empty'` extraction would yield an
+    # empty string. With it, downstream parsers always see a `^{` JSON line
+    # with status="error" and a non-success subtype.
+    if not emitted_terminal:
+        duration_ms = int((time.monotonic() - start_time) * 1000)
+        _emit_result(
+            ResultJson(
+                status="error",
+                subtype="stream_ended_without_result",
+                task_id=task_id,
+                session_id=session_id,
+                turns=guardrails.turns,
+                cost_usd=None,
+                duration_ms=duration_ms,
+                termination_reason=(
+                    "SDK message stream ended without a terminal ResultMessage. "
+                    "Likely caused by permission denial with interrupt=True or "
+                    "transport close upstream."
+                ),
+            )
+        )
+        exit_code = 1
 
     return exit_code
 
