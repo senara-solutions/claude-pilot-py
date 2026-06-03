@@ -27,12 +27,19 @@
 #     different file. Used for temporary overlays (e.g. widened groom-phase
 #     allowlists) without rebuilding cpp. The override remains as escape
 #     hatch; this bundled file is the production default.
-#   - Rule set below was derived from groom-phase pilot evidence (mika
+#   - Groom-phase rules were derived from groom-phase pilot evidence (mika
 #     dispatch-lib `_run_claude_pilot` calls captured 2026-05-28). Dev-pilot
-#     phase Bash footprint (cargo/uv/npm/file-tools) is not yet enumerated --
-#     those tool calls will hit `default: deny` and halt the pilot via
-#     joint 2's interrupt=True semantics. Extend the rule set as dev-pilot
-#     evidence is captured.
+#     phase Bash footprint (mkdir / PATH-bootstrap / cp-mv-rm / cargo / npm /
+#     uv / node) was enumerated 2026-06-03 (claude-pilot#25) from the blocked
+#     dispatches mika#1116, mika#1260, mika#765.
+#   - Why broad-looking `allow` rules below are safe: a policy rule matches a
+#     single regex against the WHOLE command string (policy.py first-match-wins
+#     — no compound-split, no danger scan). permissions.py
+#     `_bash_allow_is_chain_safe` re-applies tier1's tier3-danger +
+#     command-substitution scan over any Bash command a rule allows, so a
+#     chained dangerous tail (`mkdir foo && rm -rf ~`) is vetoed and downgraded
+#     to deny. File creation goes through the Write/Edit tools (tier1
+#     path-containment), so no Bash file-editor rule is needed here.
 # --------------------------------------------------------------------------
 
 rules:
@@ -124,6 +131,64 @@ rules:
     pattern: "^mika-ask$"
     decision: escalate
     reason: "mika-ask targets external agents -- escalate (deny + notify) for operator review"
+
+  # ---- Dev-pilot phase (claude-pilot#25) ----
+  # Bash footprint the dev-pilot pipeline needs but groom-phase rules never
+  # covered. All chained-danger safety is enforced by permissions.py
+  # `_bash_allow_is_chain_safe` (re-applies tier1 tier3 + command-substitution
+  # scan over the whole command), so these patterns only need to (a) match the
+  # intended command shape and (b) reject absolute paths / `..` traversal to
+  # honor worktree-scoping. cargo/npm/npx are already tier1-auto-approved when
+  # standalone; the rules here cover them inside a PATH-bootstrap compound and
+  # as defense-in-depth.
+
+  - id: bash-mkdir
+    tool: Bash
+    pattern: '^mkdir(\s+-\S+)*\s+(?!/)(?!.*\.\.)\S'
+    decision: allow
+    reason: "mkdir (relative, no .. traversal) -- dev-pilot worktree scaffolding (mika#1116: mkdir -p crates/mika-os/src)"
+
+  - id: bash-cp-mv
+    tool: Bash
+    pattern: '^(cp|mv)\s+(?!/)(?!.*\s/)(?!.*\.\.)\S'
+    decision: allow
+    reason: "cp/mv (relative operands, no .. or absolute) -- dev-pilot file moves within worktree"
+
+  - id: bash-rm
+    tool: Bash
+    pattern: '^rm\s+(?!/)(?!.*\s/)(?!.*\.\.)\S'
+    decision: allow
+    reason: "rm (relative, no .. or absolute) -- dev-pilot cleanup; rm -rf stays denied by the chained-danger guard (tier3)"
+
+  - id: bash-cargo
+    tool: Bash
+    pattern: '^cargo\s+(build|test|check|clippy|fmt|run|clean|doc|tree)\b'
+    decision: allow
+    reason: "cargo build/test/check/clippy/fmt/run/clean/doc/tree -- dev-pilot Rust toolchain (cargo publish excluded, tier3-denied)"
+
+  - id: bash-npm
+    tool: Bash
+    pattern: '^npm\s+(ci|install|run|test|start)\b'
+    decision: allow
+    reason: "npm ci/install/run/test/start -- dev-pilot Node toolchain (mika#1260)"
+
+  - id: bash-uv
+    tool: Bash
+    pattern: '^uv\s+(tool|sync|run|lock|venv|pip|add)\b'
+    decision: allow
+    reason: "uv tool/sync/run/lock/venv/pip/add -- dev-pilot Python toolchain (CLAUDE.md: uv tool install --force .)"
+
+  - id: bash-node-npx
+    tool: Bash
+    pattern: '^(node|npx)\s'
+    decision: allow
+    reason: "node/npx -- dev-pilot Node script + binary execution (mika#1260 nvm/volta toolchain)"
+
+  - id: bash-export-path-bootstrap
+    tool: Bash
+    pattern: '^export\s+PATH=["'']?[^"'']*(nvm|volta|\.cargo|\.local|\.rustup)[^"'']*:\$PATH'
+    decision: allow
+    reason: "narrow PATH bootstrap (nvm/volta/cargo/local/rustup, ends :$PATH) -- dev-pilot shell-env setup (mika#1260)"
 
 default:
   decision: deny
