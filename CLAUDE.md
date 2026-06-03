@@ -76,6 +76,10 @@ From `claude_agent_sdk`:
 - `AskUserQuestion` — intercepted via `can_use_tool` when `tool_name == "AskUserQuestion"`; response requires `PermissionResultAllow(updated_input={"questions": ..., "answers": ...})`.
 - `ClaudeSDKClient(options=ClaudeAgentOptions(...))` — bidirectional client; `can_use_tool` is NOT supported on the one-shot `query()` entrypoint.
 
+## Documented Solutions
+
+`docs/solutions/` — documented solutions to past problems (bugs, security findings, workflow patterns), organized by category with YAML frontmatter (`module`, `tags`, `problem_type`). Relevant when implementing or debugging in documented areas — e.g. the permission classifier (`policy.py`/`permissions.py`/`tier1.py`) has a load-bearing learning on command-string allow-rule safety.
+
 ## Planning Documents
 
 - Plan: `senara-solutions/mika-platform/docs/plans/2026-04-14-001-feat-port-claude-pilot-to-python-plan.md`
