@@ -15,11 +15,17 @@ import time
 from typing import Any, Literal
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
-from claude_agent_sdk.types import AssistantMessage, ResultMessage, SystemMessage
+from claude_agent_sdk.types import (
+    AssistantMessage,
+    ResultMessage,
+    SystemMessage,
+    SystemPromptPreset,
+)
 
 from .guardrails import SessionGuardrails, TurnBoundaryEvent
 from .inbox_writer import post_handoff
 from .permissions import CanUseTool
+from .tier1 import DENIED_BASH_PATTERNS_HINT
 from .types import ResultJson
 from .ui import (
     log_done,
@@ -59,6 +65,7 @@ async def run_agent(
         setting_sources=["user", "project", "local"],
         can_use_tool=permission_handler,
         include_partial_messages=True,
+        system_prompt=_system_prompt_with_hint(),
         **_sdk_guardrail_kwargs(config),
     )
 
@@ -279,6 +286,22 @@ async def _merge_stream(
         except StopAsyncIteration:
             return
         yield msg
+
+
+def _system_prompt_with_hint() -> SystemPromptPreset:
+    """System-prompt option that PRESERVES the Claude Code preset and appends
+    the mika#1409 denied-Bash prevention hint.
+
+    The preset+append shape is load-bearing: a plain-string ``system_prompt``
+    would REPLACE the Claude Code preset, breaking the headless ``/mika`` +
+    ``/ce:*`` pipeline that depends on it. ``SystemPromptPreset`` keeps the
+    preset and only adds the hint.
+    """
+    return {
+        "type": "preset",
+        "preset": "claude_code",
+        "append": DENIED_BASH_PATTERNS_HINT,
+    }
 
 
 def _sdk_guardrail_kwargs(config: Any) -> dict[str, Any]:

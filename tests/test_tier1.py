@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from claude_pilot.tier1 import (
+    DENIED_BASH_PATTERNS_HINT,
     INTRA_PLATFORM_AGENTS,
     contains_unquoted_metacharacter,
     is_safe_bash_command,
@@ -640,3 +641,76 @@ def test_944_end_to_end_ansi_c_bypass_denied() -> None:
 def test_944_lone_dollar_at_end_not_rejected() -> None:
     """Lone $ at end of string — no following byte, must NOT trigger."""
     assert contains_unquoted_metacharacter("echo $") is False
+
+
+# ── mika#1409: denied-Bash prevention hint ───────────────────────────────────
+
+
+def test_1409_exact_find_exec_from_1381_groom_is_denied() -> None:
+    """Regression anchor for the prevention hint: the exact `find … -exec`
+    command that crashed the mika#1381 groom (claude-pilot log 6f97dc72) is
+    genuinely denied by the auto-approval filter — i.e. the session-fatal reach
+    the hint steers around is real, not hypothetical.
+    """
+    cmd = (
+        'find /data/workspace/mika-platform/.claude/worktrees/'
+        'feat-1381-notifications-severity-tiered-operator/mika/crates/mika-agent/src '
+        '-name "*.rs" -exec grep -l "INTENT_GUARD\\|EndTurn\\|post.*condition" {} +'
+    )
+    assert is_safe_bash_command(cmd) is False
+
+
+def test_1409_hint_names_find_exec_to_grep_substitution() -> None:
+    """The hint must steer `find -exec` → Grep/Glob (the verification-bar case)."""
+    hint = DENIED_BASH_PATTERNS_HINT
+    assert "find" in hint and "-exec" in hint
+    assert "Grep" in hint
+    assert "Glob" in hint
+
+
+def test_1409_hint_names_md5sum_to_read_substitution() -> None:
+    """The hint must steer the md5sum n=2 case → Read. md5sum is denied because
+    it is not on the shell safe-list (on ANY path), NOT because of a worktree
+    boundary — `cat` outside the worktree is auto-approved (see the drift-guard
+    test below). The hint wording must describe the real mechanism."""
+    hint = DENIED_BASH_PATTERNS_HINT
+    assert "md5sum" in hint
+    assert "Read" in hint
+
+
+def test_1409_hint_covers_remaining_common_denials() -> None:
+    """The other commonly-denied patterns and their native-tool substitutes."""
+    hint = DENIED_BASH_PATTERNS_HINT
+    assert "sed -i" in hint and "Edit" in hint
+    assert "Write" in hint  # `>`/`>>` redirect substitute
+
+
+def test_1409_hint_claims_match_enforcement() -> None:
+    """Drift guard: every command the hint tells the model is DENIED must
+    actually be denied by `is_safe_bash_command`, and every recommended
+    substitute path must actually be approved. The hint lives next to the
+    deny-list to prevent drift (tier1.py comment) — this test makes that
+    promise falsifiable rather than relying on proximity alone. Backs the
+    maintainability-review finding that bullet 2 had drifted (cat-outside-
+    worktree was wrongly described as denied)."""
+    # Commands the hint names as denied — must genuinely be denied.
+    denied = [
+        'find /x -name "*.rs" -exec grep -l "Y" {} +',  # find -exec
+        "md5sum /data/workspace/mika-platform/.claude/commands/mika.md",  # not safe-listed
+        "sha256sum /tmp/x",
+        "sed -i 's/a/b/' f",  # in-place edit
+        "echo x > /tmp/y",  # redirect
+    ]
+    for cmd in denied:
+        assert is_safe_bash_command(cmd) is False, f"hint claims denied but APPROVED: {cmd}"
+
+    # The hint must NOT mislead the model into thinking these are denied.
+    # `cat` (and read-only inspection tools) ARE auto-approved on any path —
+    # the hint steers md5sum→Read precisely because cat-style reads are fine.
+    approved = [
+        "cat /etc/hostname",  # outside worktree, still approved
+        "cat /data/workspace/mika-platform/.claude/commands/mika.md",
+        'grep -rn "EndTurn" src',
+    ]
+    for cmd in approved:
+        assert is_safe_bash_command(cmd) is True, f"expected approved but DENIED: {cmd}"
