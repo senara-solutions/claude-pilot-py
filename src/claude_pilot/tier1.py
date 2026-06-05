@@ -130,6 +130,51 @@ def is_tier3_dangerous(command: str) -> bool:
     return any(p.search(stripped) for p in TIER3_PATTERNS)
 
 
+# ── Model-facing prevention hint (mika#1409) ─────────────────────────────────
+#
+# Prevention-only half of mika#1409 (Approach #2). The headless pilot model has
+# no preflight visibility into the deny-list above, so it reaches for forbidden
+# shell idioms (`find … -exec`, cross-worktree `md5sum`, `sed -i`) when an
+# auto-approved native tool serves the same goal. A policy denial returns
+# `PermissionResultDeny(interrupt=True)` (permissions.py / cpp#20 joint 2) and
+# the session DIES — so a single bad reach forces a manual rescue.
+#
+# This constant is injected into the SDK system prompt by agent.py. It lives
+# HERE, next to the patterns it describes (TIER3_PATTERNS, _FIND_DANGEROUS_RE,
+# SAFE_SHELL_COMMANDS, is_within_project), so the documentation cannot drift
+# from the enforcement. n=2 evidence: claude-pilot logs 6f97dc72 (find -exec
+# crashed the mika#1381 groom) and 548191b8 (cross-worktree md5sum crashed the
+# mika#1255 AC verification).
+#
+# Honest-closure note: this hint reduces the RATE of denied reaches; it does
+# NOT close the session-fatality class. Novel denied patterns still crash the
+# session — that class closes only when cpp#20 joint 2's contract is revised to
+# distinguish adaptation from fabrication (mika#1410).
+DENIED_BASH_PATTERNS_HINT: str = """\
+## Bash commands that crash this session — use the native tool instead
+
+The permission policy DENIES the Bash patterns below, and a denied Bash call
+terminates this session immediately (no retry, no recovery). Never reach for
+them — use the auto-approved native tool, which accomplishes the same goal:
+
+- `find … -exec` / `find … -execdir` / `find … -delete` (denied as RCE-class,
+  regardless of path) → use the **Grep** tool to search file contents and the
+  **Glob** tool to find files by name. To search inside matched files, combine
+  Glob (find paths) then Grep (search them) — never `find -exec grep`.
+- Hashing or inspecting a file with a non-safe-listed command (e.g. `md5sum`,
+  `sha256sum`) → use the **Read** tool to read the file directly. Only a small
+  allow-list of read-only shell tools is auto-approved; others like `md5sum`
+  are denied on ANY path. Read works on any absolute path, inside or outside
+  the current worktree — so prefer it for cross-worktree file comparison.
+- In-place edits via `sed -i` → use the **Edit** tool.
+- Writing files via shell redirect (`>`, `>>`) → use the **Write** tool.
+- `xargs`, `eval`, `bash -c`, `sh -c` → use the dedicated native tool
+  (Grep/Glob/Read/Edit/Write) for the underlying goal.
+
+Prefer Read, Write, Edit, Grep, and Glob over their shell equivalents: they are
+auto-approved and never halt the session."""
+
+
 # ── Safe Bash command checking ───────────────────────────────────────────────
 
 _COMPOUND_SPLIT_RE = re.compile(r"\s*(?:&&|\|\||[;|\n])\s*")

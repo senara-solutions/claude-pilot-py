@@ -427,3 +427,50 @@ async def test_agent_emits_synthetic_terminal_on_silent_stream_end(
     assert payload["task_id"] == "task_synthetic_test"
     # exit code reflects the silent-stream-end as a non-success run.
     assert exit_code == 1
+
+
+# ── mika#1409: denied-Bash prevention hint is injected into the system prompt ─
+
+
+def test_1409_system_prompt_helper_is_preset_append_with_hint() -> None:
+    """`_system_prompt_with_hint()` must PRESERVE the claude_code preset and
+    append the denied-Bash hint — a plain string would wipe the preset and
+    break the headless /mika pipeline."""
+    from claude_pilot.tier1 import DENIED_BASH_PATTERNS_HINT
+
+    sp = agent_module._system_prompt_with_hint()
+    assert sp["type"] == "preset"
+    assert sp["preset"] == "claude_code"
+    assert sp["append"] == DENIED_BASH_PATTERNS_HINT
+    assert "-exec" in sp["append"] and "Grep" in sp["append"]
+
+
+@pytest.mark.asyncio
+async def test_1409_run_agent_passes_system_prompt_into_options(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end wiring: run_agent constructs ClaudeAgentOptions with the
+    preset-append system_prompt, so every pilot session actually sees the hint.
+    """
+    captured: dict[str, Any] = {}
+
+    def _capturing_options(*_args: Any, **kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return object()  # FakeClient ignores options
+
+    monkeypatch.setattr(agent_module, "ClaudeAgentOptions", _capturing_options)
+    _install_fake_client(monkeypatch, [_init(), _result()])
+
+    await run_agent(
+        prompt="test",
+        cwd=".",
+        verbose=False,
+        task_id=None,
+        permission_handler=_noop_permission,
+        guardrails=SessionGuardrails(_config()),
+    )
+
+    sp = captured.get("system_prompt")
+    assert isinstance(sp, dict)
+    assert sp["type"] == "preset" and sp["preset"] == "claude_code"
+    assert "-exec" in sp["append"] and "Grep" in sp["append"]
