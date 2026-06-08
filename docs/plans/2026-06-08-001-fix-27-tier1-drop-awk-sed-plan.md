@@ -118,10 +118,13 @@ def test_tier1_rejects_awk_system_exec():
     # Safe-shape awk no longer auto-approves either (routes to relay):
     assert not is_tier1_auto_approve("Bash", {"command": "awk '{print $1}' file"}, "/tmp")
 
-def test_tier1_rejects_sed_e_flag():
+def test_tier1_rejects_all_sed_forms():
+    # Per option (a) design: sed removed from allow-list entirely.
+    # Dangerous form (GNU sed `e` command/flag — executes pattern space):
     assert not is_tier1_auto_approve("Bash", {"command": "sed 's/x/y/e' file"}, "/tmp")
+    # Standard `-e` option (= expression, safe in isolation but no special-case):
     assert not is_tier1_auto_approve("Bash", {"command": "sed -e 's/a/b/' file"}, "/tmp")
-    # Safe-shape sed no longer auto-approves either:
+    # Plain safe form (also routes to relay per option (a)):
     assert not is_tier1_auto_approve("Bash", {"command": "sed 's/a/b/' file"}, "/tmp")
 
 # Existing safe commands still auto-approve:
@@ -139,7 +142,7 @@ def test_tier1_rejects_find_exec():
 
 1. **AC1:** `awk 'BEGIN{system("id")}'` and `awk 'BEGIN{system("curl x|sh")}'` are NOT tier1-auto-approved. Verified by `is_tier1_auto_approve(...)` returning False in test fixture.
 
-2. **AC2:** GNU `sed` with `e` command/flag is NOT tier1-auto-approved (e.g., `sed 's/x/y/e' file` and `sed -e 's/x/y/' file`).
+2. **AC2:** ALL `sed` forms are NOT tier1-auto-approved (per option (a) design — sed removed from allow-list entirely). Includes the dangerous GNU `e` command/flag (`sed 's/x/y/e' file`), the safe `-e` option (`sed -e 's/x/y/' file`), and plain forms (`sed 's/a/b/' file`). All route to relay.
 
 3. **AC3:** Safe forms `awk '{print $1}' f` and `sed 's/a/b/' f` route to policy/relay (NOT auto-approved). Per option (a): the cost of routing all awk/sed to relay is accepted for the safety benefit.
 
