@@ -75,6 +75,17 @@ TIER1_SAFE_SKILLS: frozenset[str] = frozenset({
 
 
 # ── Deny-list ────────────────────────────────────────────────────────────────
+#
+# TIER3 is a "deny these even though tier1 would otherwise pass them" list,
+# NOT the safety boundary. The allow-list (SAFE_SHELL_COMMANDS + per-command
+# sub-feature guards) is the safety boundary. TIER3 catches known-dangerous
+# patterns in commands that would otherwise pass tier1's allow-list.
+# If a TIER3 entry is the SOLE protection against a tier1-allowed command's
+# sub-feature (e.g., relying on `rm -rf` substring to block
+# `awk 'BEGIN{system("rm -rf ~")}'`), the allow-list is misshapen — fix the
+# allow-list, not the denylist. cpp#27 was an instance: awk + sed were dropped
+# from SAFE_SHELL_COMMANDS because their sub-feature exec routes can't be
+# exhaustively guarded.
 
 # Strip universal stderr/stdout silencing (`2>/dev/null`, `1>/dev/null`) before
 # running the TIER3_PATTERNS regex check. `is_tier3_dangerous` denies any `>`
@@ -341,9 +352,14 @@ def is_safe_build_command(sub: str) -> bool:
 # ── Safe shell commands ──────────────────────────────────────────────────────
 
 SAFE_SHELL_COMMANDS: frozenset[str] = frozenset({
-    # Read-only inspection
-    "ls", "cat", "head", "tail", "wc", "find", "grep", "sed",
-    "awk", "echo", "printf", "dirname", "basename",
+    # Read-only inspection. `awk` and `sed` excluded by design (cpp#27):
+    # both are general-purpose interpreters with arbitrary-code-execution
+    # sub-features (awk `system()`/`print|"cmd"`/`getline|"cmd"`/`BEGIN{cmd}`,
+    # GNU sed `e` command/flag) that an exhaustive sub-feature guard can't
+    # enumerate safely. Both route to policy/relay where intent is judged
+    # explicitly. See plan: docs/plans/2026-06-08-001-fix-27-tier1-drop-awk-sed-plan.md
+    "ls", "cat", "head", "tail", "wc", "find", "grep",
+    "echo", "printf", "dirname", "basename",
     "realpath", "readlink", "stat", "file", "which", "type",
     "pwd", "date", "sort", "uniq", "tr", "cut", "diff",
     "comm", "test", "[",
@@ -357,7 +373,6 @@ SAFE_SHELL_COMMANDS: frozenset[str] = frozenset({
 })
 
 _FIRST_WORD_RE = re.compile(r"^\s*(\S+)")
-_SED_INPLACE_RE = re.compile(r"\s-\w*i\b")
 _FIND_DANGEROUS_RE = re.compile(r"-(exec|execdir|delete)\b")
 
 
@@ -370,8 +385,6 @@ def is_safe_shell_command(sub: str) -> bool:
     if cmd not in SAFE_SHELL_COMMANDS:
         return False
 
-    if cmd == "sed" and _SED_INPLACE_RE.search(sub):
-        return False
     if cmd == "find" and _FIND_DANGEROUS_RE.search(sub):
         return False
 
