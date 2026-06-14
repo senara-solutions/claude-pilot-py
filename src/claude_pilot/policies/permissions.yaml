@@ -62,9 +62,9 @@ rules:
 
   - id: bash-jq
     tool: Bash
-    pattern: "^(for\\s.*do\\s+.*\\s)?jq\\s|;\\s*jq\\s"
+    pattern: "^(for\\s.*do\\s+.*\\s)?jq\\s|[;|]\\s*jq\\s"
     decision: allow
-    reason: "jq for skill-manifest and JSON inspection"
+    reason: "jq for skill-manifest and JSON inspection (also `cmd | jq …` pipeline)"
 
   - id: bash-for-loop-orientation
     tool: Bash
