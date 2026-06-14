@@ -844,3 +844,91 @@ def test_split_compound_unterminated_quote_falls_through() -> None:
     segs = _split_compound_command(cmd)
     assert len(segs) == 1
     assert is_safe_bash_command(cmd) is False
+
+
+# ── `gh auth status` allow-list extension ────────────────────────────────────
+# Pre-fix: `gh auth` was not in SAFE_GH_SUBCOMMANDS — the pilot's
+# `gh auth status 2>&1 | head -10` research call was denied by tier1, halting
+# the mika#624 groom session. `auth status` is read-only and never emits the
+# raw token value; other `gh auth` verbs (login/logout/refresh/setup-git/token)
+# remain denied because they either mutate or leak secrets.
+
+
+def test_gh_auth_status_now_tier1_safe() -> None:
+    """`gh auth status` is read-only — surfaces installation + scope state
+    without ever emitting the raw token."""
+    from claude_pilot.tier1 import is_safe_gh_command
+
+    assert is_safe_gh_command("gh auth status") is True
+    assert is_safe_bash_command("gh auth status") is True
+    assert is_safe_bash_command("gh auth status 2>&1 | head -10") is True
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # `token` emits secret to stdout — MUST stay denied.
+        "gh auth token",
+        # Auth flow / mutation verbs — MUST stay denied.
+        "gh auth login",
+        "gh auth logout",
+        "gh auth refresh",
+        "gh auth setup-git",
+    ],
+)
+def test_gh_auth_non_status_verbs_still_denied(command: str) -> None:
+    """Only `gh auth status` is allowed; other `gh auth` verbs are denied
+    because they mutate (login/logout/refresh/setup-git) or leak secrets
+    (token)."""
+    from claude_pilot.tier1 import is_safe_gh_command
+
+    assert is_safe_gh_command(command) is False
+
+
+# ── bash-jq policy regex covers pipe-to-jq ───────────────────────────────────
+# Pre-fix: `bash-jq` regex was `^(for\s.*do\s+.*\s)?jq\s|;\s*jq\s` — matched
+# `^jq ` and `; jq ` only. The dominant idiom `cmd | jq '...'` was NOT matched.
+# With the quote-aware splitter (cpp#31), the jq segment is bare `jq '...'`
+# which isn't tier1-safe (jq isn't in SAFE_SHELL_COMMANDS) AND doesn't match
+# the bash-jq policy. Falls through to default-deny → halted mika#625 groom.
+
+
+def test_bash_jq_policy_regex_matches_pipe_to_jq() -> None:
+    """The `bash-jq` policy regex must match the pipe-to-jq idiom
+    `cmd | jq '...'`. This mirrors the regex shape shipped in
+    permissions.yaml — update both together."""
+    import re
+
+    bash_jq_pattern = re.compile(r"^(for\s.*do\s+.*\s)?jq\s|[;|]\s*jq\s")
+
+    # Matches BEFORE fix (kept working).
+    assert bash_jq_pattern.search("jq '.name'")
+    assert bash_jq_pattern.search("foo; jq '.name'")
+
+    # NEW matches AFTER fix (mika#625 regression class).
+    assert bash_jq_pattern.search("gh release view --json tagName | jq '.tagName'")
+    assert bash_jq_pattern.search("cat foo.json | jq '.name'")
+    assert bash_jq_pattern.search("curl https://api.example.com/x | jq '.field'")
+
+    # MUST NOT match bare `jq` mid-word (e.g. `pjq`, `myjq`).
+    assert not bash_jq_pattern.search("myjq")
+    assert not bash_jq_pattern.search("foo-jq value")
+
+
+def test_bash_jq_pattern_in_shipped_policy_file() -> None:
+    """The pipe-to-jq fix is in the shipped policy YAML, not just the test."""
+    from pathlib import Path
+
+    policy_yaml = (
+        Path(__file__).parent.parent
+        / "src"
+        / "claude_pilot"
+        / "policies"
+        / "permissions.yaml"
+    )
+    content = policy_yaml.read_text()
+
+    # The bash-jq rule's pattern must include the pipe alternation.
+    assert r"[;|]\\s*jq\\s" in content, (
+        "bash-jq policy must allow `cmd | jq ...` (mika#625 regression class)"
+    )

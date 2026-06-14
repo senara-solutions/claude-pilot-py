@@ -471,6 +471,12 @@ SAFE_GH_SUBCOMMANDS: dict[str, frozenset[str]] = {
     "repo":     frozenset({"view"}),
     "release":  frozenset({"view", "list"}),
     "workflow": frozenset({"view", "list"}),
+    # `auth status` is read-only — surfaces which gh installation is active,
+    # which scopes are granted, and whether the cached token works. The
+    # output never includes the raw token value. Other `gh auth` verbs
+    # (login, logout, refresh, setup-git, token) MUST stay out — `token`
+    # emits secret to stdout, the rest are mutation/auth-flow operations.
+    "auth":     frozenset({"status"}),
 }
 
 _GH_DOMAIN_RE = re.compile(r"^\s*gh\s+(\S+)\s+(\S+)")
