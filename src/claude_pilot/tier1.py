@@ -188,20 +188,91 @@ auto-approved and never halt the session."""
 
 # ── Safe Bash command checking ───────────────────────────────────────────────
 
-_COMPOUND_SPLIT_RE = re.compile(r"\s*(?:&&|\|\||[;|\n])\s*")
-
 
 def _split_compound_command(command: str) -> list[str]:
-    """Naive split on shell operators AND raw newlines. Not quote-aware —
-    unsafe splits inside quoted strings simply won't match any safe pattern
-    and fall through to relay. Safe by design.
+    """Quote-aware split on shell operators AND raw newlines.
 
-    `\\n` is included because bash treats a bare newline as a command
-    separator equivalent to `;`. Without splitting on `\\n`, a payload like
+    Splits on ``&&``, ``||``, ``;``, ``|``, and ``\\n`` only when they appear
+    OUTSIDE of single- or double-quoted regions. Quote handling mirrors POSIX
+    semantics used by ``contains_unquoted_metacharacter`` in this module:
+
+    - Inside ``"..."``, ``\\"`` is an escape pair (skipped atomically); other
+      backslash sequences pass through as-is so ``"a\\|b"`` does not close the
+      quote on ``\\``.
+    - Inside ``'...'``, backslash is literal — only a closing ``'`` ends the
+      quoted region.
+    - Unterminated quotes: remaining bytes are treated as inside the quote
+      (conservative — falls through to the LLM relay on malformed input).
+
+    ``\\n`` is included because bash treats a bare newline as a command
+    separator equivalent to ``;``. Without splitting on ``\\n``, a payload like
     ``git status\\nrm -rf /`` would be evaluated as one segment, miss the
     rm-rf regex on the second line, and auto-approve via the safe-git prefix.
+
+    Pre-fix: split was a single quote-blind regex that matched ``|`` inside
+    grep regex alternations (``grep "a\\|b\\|c"``), shredding the segment list
+    into nonsense substrings. Every "segment" then failed the safe-list checks,
+    tier1 rejected the entire research grep, and the downstream chain-safety
+    check halted the pilot with `policy-deny [bash-grep]` even though the
+    research command was inherently safe (read-only grep + cargo doc).
+    Observed wedging mika#96 and mika#623 dispatch on 2026-06-14.
     """
-    return [s for s in (part.strip() for part in _COMPOUND_SPLIT_RE.split(command)) if s]
+    segments: list[str] = []
+    n = len(command)
+    i = 0
+    seg_start = 0
+    quote_state: str | None = None  # None / "'" / '"'
+
+    while i < n:
+        ch = command[i]
+
+        if quote_state is None:
+            if ch in ("'", '"'):
+                quote_state = ch
+                i += 1
+                continue
+            if ch in (";", "\n"):
+                segments.append(command[seg_start:i].strip())
+                i += 1
+                seg_start = i
+                continue
+            if ch == "&" and i + 1 < n and command[i + 1] == "&":
+                segments.append(command[seg_start:i].strip())
+                i += 2
+                seg_start = i
+                continue
+            if ch == "|":
+                if i + 1 < n and command[i + 1] == "|":
+                    segments.append(command[seg_start:i].strip())
+                    i += 2
+                    seg_start = i
+                else:
+                    segments.append(command[seg_start:i].strip())
+                    i += 1
+                    seg_start = i
+                continue
+            i += 1
+            continue
+
+        # inside a quote
+        if quote_state == '"':
+            if ch == "\\" and i + 1 < n and command[i + 1] == '"':
+                i += 2
+                continue
+            if ch == '"':
+                quote_state = None
+            i += 1
+            continue
+
+        # quote_state == "'"
+        if ch == "'":
+            quote_state = None
+        i += 1
+
+    tail = command[seg_start:].strip()
+    if tail:
+        segments.append(tail)
+    return [s for s in segments if s]
 
 
 def contains_unquoted_metacharacter(command: str) -> bool:

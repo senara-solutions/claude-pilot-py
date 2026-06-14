@@ -16,6 +16,7 @@ import pytest
 from claude_pilot.tier1 import (
     DENIED_BASH_PATTERNS_HINT,
     INTRA_PLATFORM_AGENTS,
+    _split_compound_command,
     contains_unquoted_metacharacter,
     is_safe_bash_command,
     is_safe_git_command,
@@ -750,3 +751,96 @@ def test_1409_hint_claims_match_enforcement() -> None:
     ]
     for cmd in approved:
         assert is_safe_bash_command(cmd) is True, f"expected approved but DENIED: {cmd}"
+
+
+# ── Quote-aware compound split ───────────────────────────────────────────────
+# Pre-fix regression: `_split_compound_command` was a quote-blind regex that
+# matched `|`/`;`/`&&`/`||` inside quoted strings. A research grep with regex
+# alternation (`grep "a\|b\|c"`) was shredded into nonsense segments, every
+# segment failed the safe-list check, and the pilot halted with
+# `policy-deny [bash-grep]`. Observed wedging mika#96 and mika#623 dispatch
+# on 2026-06-14.
+
+
+@pytest.mark.parametrize(
+    "command,expected_segments",
+    [
+        # Operators inside double quotes do NOT split.
+        (r'grep "a\|b\|c" file', [r'grep "a\|b\|c" file']),
+        (
+            r'grep "pub fn x\|pub fn y" src',
+            [r'grep "pub fn x\|pub fn y" src'],
+        ),
+        # Operators inside single quotes do NOT split.
+        ("echo 'foo;bar||baz' done", ["echo 'foo;bar||baz' done"]),
+        # Mixed: quoted region preserved, unquoted operator splits.
+        (
+            r'grep "a\|b" file | head -5',
+            [r'grep "a\|b" file', "head -5"],
+        ),
+        (
+            r'grep "a\|b" file || cargo test',
+            [r'grep "a\|b" file', "cargo test"],
+        ),
+        # Real-world regression — the exact command that wedged mika#96.
+        (
+            r'grep -r "pub fn delete_word\|pub fn delete_line_by_head\|pub fn select_all" '
+            r"target/debug/.fingerprint/ 2>/dev/null | head -5 "
+            r"|| cargo doc -p tui-textarea --no-deps 2>&1 | tail -5",
+            [
+                r'grep -r "pub fn delete_word\|pub fn delete_line_by_head\|pub fn select_all" '
+                r"target/debug/.fingerprint/ 2>/dev/null",
+                "head -5",
+                "cargo doc -p tui-textarea --no-deps 2>&1",
+                "tail -5",
+            ],
+        ),
+        # Escaped double quote inside double quotes does NOT close.
+        (r'echo "a\"|b" tail', [r'echo "a\"|b" tail']),
+        # Newline IS a separator (parity with semicolon).
+        ("git status\nrm -rf /", ["git status", "rm -rf /"]),
+        # `&&` splits.
+        ("a && b && c", ["a", "b", "c"]),
+        # `||` splits.
+        ("a || b", ["a", "b"]),
+        # `;` splits.
+        ("a; b; c", ["a", "b", "c"]),
+    ],
+)
+def test_split_compound_command_quote_aware(
+    command: str, expected_segments: list[str]
+) -> None:
+    assert _split_compound_command(command) == expected_segments
+
+
+def test_split_compound_unwedge_mika_96_research_grep() -> None:
+    """The exact command that policy-denied the mika#96 dispatch pilot is now
+    tier1-safe end-to-end."""
+    cmd = (
+        r'grep -r "pub fn delete_word\|pub fn delete_line_by_head\|pub fn select_all" '
+        r"target/debug/.fingerprint/ 2>/dev/null | head -5 "
+        r"|| cargo doc -p tui-textarea --no-deps 2>&1 | tail -5"
+    )
+    assert is_safe_bash_command(cmd) is True
+    assert is_tier1_auto_approve("Bash", {"command": cmd}, "/data") is True
+
+
+def test_split_compound_quoted_danger_no_longer_disguised() -> None:
+    """An rm-rf chained outside a quoted region must still be caught even
+    though earlier segments contain quoted operators."""
+    cmd = r'grep "a\|b" file; rm -rf /'
+    segs = _split_compound_command(cmd)
+    assert segs == [r'grep "a\|b" file', "rm -rf /"]
+    assert is_safe_bash_command(cmd) is False
+
+
+def test_split_compound_unterminated_quote_falls_through() -> None:
+    """Unterminated quotes treat the rest of the string as quoted — safer
+    than splitting on operators that might be inside an intended string. The
+    command falls through to relay rather than being tier1-approved."""
+    cmd = 'grep "unclosed | rm -rf /'
+    # Unterminated quote means the rest is treated as inside the quote, so
+    # no splits happen and the single segment doesn't match any safe pattern.
+    segs = _split_compound_command(cmd)
+    assert len(segs) == 1
+    assert is_safe_bash_command(cmd) is False
