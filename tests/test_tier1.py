@@ -17,6 +17,7 @@ from claude_pilot.tier1 import (
     DENIED_BASH_PATTERNS_HINT,
     INTRA_PLATFORM_AGENTS,
     _is_safe_command_builtin,
+    _is_safe_sort_command,
     _is_safe_xargs_command,
     _split_compound_command,
     contains_unquoted_metacharacter,
@@ -646,6 +647,108 @@ def test_command_builtin_narrower_than_full_tier1(inner: str) -> None:
     assert is_safe_bash_command(inner) is True, f"bare: {inner}"
     # ...but the `command`-wrapped form does not (deliberate narrowing).
     assert is_safe_bash_command(f"command {inner}") is False, f"wrapped: command {inner}"
+
+
+# ── cpp#64: sort -o write guard ──────────────────────────────────────────────
+#
+# `sort` is in SAFE_SHELL_COMMANDS because `sort <file>` is read-only — but
+# `sort -o FILE` / `--output=FILE` writes its output to an arbitrary FILE (a
+# `sort` built-in flag, not a shell redirect, so the Tier-3 `>` pattern misses
+# it). The entry stays as a marker; `_is_safe_sort_command` is the real guard
+# (same move as cpp#33 find / cpp#40 xargs / cpp#60 command). Closed-world: deny
+# any output-flag shape, allow the read-only forms.
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "sort file.txt",
+        "sort -k 2 file.txt",
+        "sort -u file.txt",
+        "sort -n -r file.txt",
+        "sort -k2,2 -t , file.csv",      # key/field flags, no output
+        "sort --reverse --unique file.txt",  # read-only long flags (not --o…)
+        # Value-taking short flags whose attached value contains 'o' must NOT be
+        # mistaken for the -o output flag (getopt: value consumes rest of token).
+        "sort -T/tmp/foo in.txt",        # -T tempdir path with 'o' (very common)
+        "sort -to in.txt",               # -t separator = literal 'o'
+        "sort -T /tmp/logs in.txt",      # -T separate-value form
+        "sort -k1,1o in.txt",            # 'o' inside -k key value
+        "sort -- -o",                    # literal filename `-o` after `--` (no write)
+    ],
+)
+def test_sort_readonly_allowed(command: str) -> None:
+    assert _is_safe_sort_command(command) is True, command
+    assert is_safe_bash_command(command) is True, command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "sort -o out.txt in.txt",                 # -o FILE (separate value)
+        "sort -oout.txt in.txt",                  # -oFILE (attached value)
+        "sort --output=out.txt in.txt",           # long form, = packed
+        "sort --output out.txt in.txt",           # long form, separate value
+        # GNU getopt prefix abbreviations of --output (cpp#64 review bypass):
+        "sort --out=out.txt in.txt",
+        "sort --o=out.txt in.txt",
+        "sort --outp out.txt in.txt",
+        "sort --outpu=out.txt in.txt",
+        "sort -o /etc/passwd in.txt",             # arbitrary absolute write
+        "sort in.txt -o .git/hooks/post-checkout",  # flag after positional
+        "sort -uo out.txt in.txt",                # cluster: -o is terminator
+    ],
+)
+def test_sort_write_denied(command: str) -> None:
+    assert _is_safe_sort_command(command) is False, command
+    assert is_safe_bash_command(command) is False, command
+
+
+def test_sort_readonly_pipe_allowed() -> None:
+    """A pipe segment `… | sort` is split upstream by the compound-command
+    splitter, so each segment reaches the guard as a bare `sort …` and stays
+    auto-approved (R4)."""
+    assert is_safe_bash_command("cat file.txt | sort") is True
+    assert is_safe_bash_command("grep foo file.txt | sort -u") is True
+
+
+def test_sort_write_exploit_regression() -> None:
+    """cpp#64 founding exploit: `sort -o <control-plane-file>` must no longer
+    auto-approve at Tier 1 (it now routes to policy / the cpp#42 destination
+    validator). Asserted at is_tier1_auto_approve, matching the issue body's
+    executed reproduction."""
+    assert (
+        is_tier1_auto_approve(
+            "Bash", {"command": "sort -o /etc/passwd input"}, "/tmp"
+        )
+        is False
+    )
+    assert (
+        is_tier1_auto_approve(
+            "Bash",
+            {"command": "sort input -o .git/hooks/post-checkout"},
+            "/tmp",
+        )
+        is False
+    )
+
+
+def test_sort_write_deny_not_via_tier3() -> None:
+    """Layer placement: `sort -o …` is denied at the allow-list layer, NOT by a
+    TIER3 pattern — the guard is `_is_safe_sort_command`, not the denylist.
+    Mirrors test_command_builtin_deny_not_via_tier3."""
+    assert is_tier3_dangerous("sort -o /etc/passwd input") is False
+    assert is_safe_bash_command("sort -o /etc/passwd input") is False
+
+
+def test_sort_substitution_guard_denies() -> None:
+    """The shared `_contains_substitution` guard denies single-quoted (inert)
+    `$(`/backtick directly — a read-only `sort` never needs substitution; its
+    presence smuggles execution (mirrors the xargs/command guards). Clean
+    read-only forms still pass."""
+    assert _is_safe_sort_command("sort '$(id)' file") is False
+    assert _is_safe_sort_command("sort '`id`' file") is False
+    assert _is_safe_sort_command("sort -u file.txt") is True
 
 
 # ── cpp#27: awk + sed dropped from SAFE_SHELL_COMMANDS ───────────────────────
