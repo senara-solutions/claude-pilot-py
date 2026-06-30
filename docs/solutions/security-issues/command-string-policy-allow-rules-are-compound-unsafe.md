@@ -7,7 +7,7 @@ component: permission-classifier
 problem_type: security_issue
 category: security-issues
 severity: critical
-tags: [permissions, policy, bash, regex, heredoc, allow-list, rce, claude-pilot-25, claude-pilot-34, command-substitution]
+tags: [permissions, policy, bash, regex, heredoc, allow-list, rce, symlink, toctou, command-substitution, claude-pilot-25, claude-pilot-34, claude-pilot-35]
 applies_when: "adding or reviewing any rule that decides allow/deny on a raw shell command string"
 ---
 
@@ -90,6 +90,12 @@ adversarial reviewer **running** candidate command strings (several against real
 bash), not by reading the diff. Budget multiple executed-exploit passes for any
 change to the safety surface; treat "I reasoned it's safe" as unproven.
 
+cpp#35 reconfirmed this at n=2: a structural-shape-only review (a 20-case
+hand-built matrix) passed, but a separate adversarial agent **running a committed
+symlink against real `git`** found an out-of-worktree write the matrix missed
+(see #5). The shape matrix proves the regex; the executed exploit proves the
+*system*. Run both.
+
 ### 4. Relax the gate with a closed-world allowlist of whole substitution tokens — never by lexing the inside
 
 The blanket "veto on any `$(`/backtick/`$'`" (guidance §1) over-blocks legitimate
@@ -150,6 +156,46 @@ now — the quote/brace-blind compound splitter shreds them on their internal `;
 so there is no live hole, but a future change to the splitter could open one. Flagged
 for awareness, not action.
 
+### 5. A static command-string check is a pre-exec SHAPE filter, not a runtime sandbox — it cannot close symlink traversal
+
+A regex can only reason about the *symbols* in a command string. It cannot
+reason about *filesystem state* — most importantly, whether a path component is
+a symlink. So a write rule that admits a multi-component relative target
+(`> docs/plans/X.md`, `cp a b/c`, `mkdir a/b`) cannot prevent escape through a
+**committed symlink**:
+
+```bash
+# worktree has a committed symlink  esc -> ../OUTSIDE
+git show <SHA>:payload > esc/passwd   # regex: relative, no `..`, no `~` -> ALLOWED
+                                       # bash opens esc/passwd -> kernel follows esc -> writes ../OUTSIDE/passwd
+```
+
+The `(?!.*\.\.)` lookahead is useless here — there is no literal `..`; the
+traversal lives in the symlink, which the string does not reveal. This residual
+is **shared by every structural write rule** (`bash-cp-mv`, `bash-mkdir`,
+`bash-git-show-redirect`), not a property of any one of them.
+
+cpp#35 originally specified "the literal target string closes B2 (path-traversal
+via symlink chasing), and must NOT use `realpath()` (TOCTOU-vulnerable)." That
+goal and that mechanism are **mutually unsatisfiable**: detecting a symlink
+*requires* touching the filesystem, which a literal-string check by definition
+does not do. The architect (mika-arch session fe891012) resolved it by accepting
+the residual at policy parity rather than making one rule asymmetrically strict —
+and correcting the rule's comment to disclose the residual instead of claiming a
+guarantee it does not provide. **When a security guarantee depends on filesystem
+state, name the layer that actually enforces it.** Here, true worktree
+containment is a *runtime* concern: the Write native tool (the documented
+substitute for `>` redirects) already enforces it via `is_within_project`
+(`Path.resolve(strict=False)` + containment), so shell redirects are strictly
+weaker than the tool they substitute for. Closing it policy-wide (resolve-and-
+contain on every write rule's destination) is tracked in cpp#38.
+
+Corollary: don't write a comment that claims a stronger guarantee than the
+mechanism delivers. An overstated "closes B2" in a security rule is worse than no
+comment — the next reader trusts it. State what the check *actually* rejects
+(literal `../`, absolute, `~`, shell-expansion) and disclose what it does not
+(symlink traversal), with a pointer to the layer that does.
+
 ## When to Apply
 
 - Adding/reviewing any `permissions.yaml` rule, or any code deciding allow/deny on
@@ -170,5 +216,7 @@ for awareness, not action.
   exist symmetrically there.
 - Accepted residuals (not bugs): in-worktree code execution (`node ./build.js`,
   `cargo test`, `uv run pytest` run project code — the worktree is the trust
-  boundary); `npm install`/`uv add` run package scripts; `/tmp` heredoc
-  symlink/TOCTOU is a runtime concern outside static policy scope.
+  boundary); `npm install`/`uv add` run package scripts; **symlink/TOCTOU on any
+  write target** (`/tmp` heredoc, and every structural write rule —
+  `bash-cp-mv`/`bash-mkdir`/`bash-git-show-redirect`) is a runtime concern
+  outside static policy scope (see #5; closing it policy-wide = cpp#38).
