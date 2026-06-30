@@ -828,6 +828,89 @@ def _is_safe_command_builtin(sub: str) -> bool:
     return is_safe_shell_command(" ".join(rest))
 
 
+def _is_safe_sort_command(sub: str) -> bool:
+    """Decide whether a `sort` invocation is safe to auto-approve (cpp#64).
+
+    `sort` is in SAFE_SHELL_COMMANDS because the common shape `sort <file>` is
+    read-only — but `sort -o FILE` (and `--output=FILE` / `--output FILE`) writes
+    its sorted output to an arbitrary FILE. That output flag is a `sort` built-in,
+    NOT a shell redirect, so neither the Tier-2 policy nor the Tier-3 `>` pattern
+    catches it: it is a tier1-reachable arbitrary-file-write primitive, including
+    the control plane (`.git/hooks/*`, `.github/workflows/*`, `.claude/*`). Same
+    architectural move as cpp#33 (`find -fprintf` write) / cpp#60 (`command tee`):
+    the entry stays in SAFE_SHELL_COMMANDS as a marker; THIS function is the real
+    guard, enforcing the §6(a) precondition that an allowlist entry is only as
+    safe as the read-only premise of its own flags (see
+    docs/solutions/security-issues/command-string-policy-allow-rules-are-compound-unsafe.md).
+
+    Closed-world: DENY any invocation carrying the output flag, in any of its
+    shapes; ALLOW the read-only forms (`sort file`, `sort -k 2 file`,
+    `sort -u file`, a pipe segment `… | sort`). Denial routes to policy/relay —
+    the destination is NOT validated here (that is cpp#42's layer, reached once
+    the command routes through Tier 2). Over-block is the safe direction.
+
+    Denies:
+    - `-o FILE` / `-oFILE` (attached) / a cluster whose `-o` is reached before
+      any value-taking flag (e.g. `-uo FILE`). The cluster is walked
+      left-to-right with getopt semantics so a value-taking flag (-k/-S/-t/-T)
+      consumes the rest of the token — `-to` / `-T/tmp/log` carry an `o` in
+      their value, not the output flag, and stay allowed.
+    - `--output` / `--output=FILE` and every GNU getopt prefix abbreviation
+      down to `--o` (long forms).
+    - any command substitution (`$(`, backtick, `$'`) anywhere — a read-only
+      `sort` never needs it; its presence smuggles execution (shared
+      `_contains_substitution`, mirrors find/xargs/command).
+
+    A `--` end-of-options token stops flag scanning: tokens after `--` are
+    positional file operands, never flags, so `sort -- -o` sorts a file literally
+    named `-o` (no write) and is allowed.
+    """
+    if _contains_substitution(sub):
+        return False
+
+    tokens = sub.split()
+    if not tokens or tokens[0] != "sort":
+        return False
+
+    for tok in tokens[1:]:
+        if tok == "--":
+            break  # end of options — the rest are file operands, never flags
+        if tok.startswith("--"):
+            # Long option. GNU getopt accepts any UNAMBIGUOUS PREFIX abbreviation
+            # of a long option, and `--output` is `sort`'s only `--o…` option, so
+            # `--output`, `--outpu`, `--outp`, `--out`, `--ou`, `--o` — each with
+            # `=FILE` or a separate value — ALL reach the write path. An exact
+            # `--output` match would miss every abbreviation (the cpp#64 review's
+            # founding bypass). Deny any long token whose name (before `=`) is a
+            # non-empty prefix of `--output` (i.e. `--o` … `--output`). No
+            # read-only `sort` long option begins with `--o`, so this over-blocks
+            # nothing legitimate.
+            name = tok.split("=", 1)[0]
+            if len(name) >= 3 and "--output".startswith(name):
+                return False  # output write flag (full or abbreviated)
+            continue  # other long flag (e.g. --key=, --reverse)
+        if tok.startswith("-") and len(tok) > 1:
+            # Short-flag token (cluster + optional attached value). Walk the
+            # cluster left-to-right with getopt semantics: `-o` is the output
+            # write flag → deny; the OTHER value-taking short flags
+            # (-k/-S/-t/-T) consume the REST of the token as their attached
+            # value, so an `o` after one of them is data, not the output flag →
+            # stop scanning. No-arg flags (-u/-n/-r/…) skip to the next char.
+            # This distinguishes `-uo` (cluster -u -o → write → deny) and `-oF`
+            # (output to file F → deny) from `-to` / `-T/tmp/log` (separator /
+            # temp-dir value containing `o`, read-only → allow). A bare `o` is
+            # always the output flag because `-o` is `sort`'s only `o` short
+            # flag.
+            for ch in tok[1:]:
+                if ch == "o":
+                    return False  # output write flag
+                if ch in ("k", "S", "t", "T"):
+                    break  # value-taking flag — rest of token is its value
+            continue
+        # positional / value token → skip
+    return True
+
+
 def is_safe_shell_command(sub: str) -> bool:
     match = _FIRST_WORD_RE.match(sub)
     if not match:
@@ -845,6 +928,9 @@ def is_safe_shell_command(sub: str) -> bool:
 
     if cmd == "command":
         return _is_safe_command_builtin(sub)
+
+    if cmd == "sort":
+        return _is_safe_sort_command(sub)
 
     return True
 
