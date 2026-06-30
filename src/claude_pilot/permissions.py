@@ -177,21 +177,37 @@ _BARE_AMP_RE = re.compile(r"(?<![>&\d])&(?!&|>)")
 # the classifier's close-point cannot diverge from bash's — there is no
 # delimiter to mis-parse. The opener must be the entire first line (``^…$``):
 # ``cat`` redirecting to a single ``/tmp/<token>`` path (no spaces, no ``..``),
-# then ``<<`` / ``<<-`` and exactly ``EOF`` / ``'EOF'`` / ``"EOF"``. Anything
-# chained or substituted before ``<<`` breaks the full-line match → veto.
+# then ``<<`` / ``<<-`` and a QUOTED delimiter — exactly ``'EOF'`` or ``"EOF"``.
+# Anything chained or substituted before ``<<`` breaks the full-line match → veto.
+#
+# The delimiter MUST be quoted (cpp#47). The close-point fix above made the
+# *terminator* safe, but body expansion is a separate axis: with a bare unquoted
+# ``<<EOF`` bash expands the heredoc body, so ``$(…)`` / backtick / ``${ …; }``
+# funsub in the body EXECUTE during heredoc expansion (verified on bash 5.3.9) —
+# while this gate, returning early before the substitution-marker veto, would
+# auto-approve the command. Quoting the delimiter (``'EOF'`` or ``"EOF"``; either
+# form disables expansion, verified on bash 5.3.9) makes the body provably inert,
+# restoring the "inert /tmp file write" guarantee this exception was designed for
+# (cpp#34/#35). Writing literal ``$(…)`` *content* to a file requires a quoted
+# delimiter anyway, so no legitimate use is lost. See the §2 heredoc lesson in
+# docs/solutions/security-issues/command-string-policy-allow-rules-are-compound-unsafe.md.
 _SANCTIONED_HEREDOC_OPENER_RE = re.compile(
-    r"""^cat\s+>\s+/tmp/(?!.*\.\.)[\w./-]+\s+<<-?\s*(?:'EOF'|"EOF"|EOF)\s*$"""
+    r"""^cat\s+>\s+/tmp/(?!.*\.\.)[\w./-]+\s+<<-?\s*(?:'EOF'|"EOF")\s*$"""
 )
 _HEREDOC_TERMINATOR = "EOF"
 
 
 def _is_sanctioned_pure_heredoc(command: str) -> bool:
-    """True only for ``cat > /tmp/<token> <<EOF`` … ``EOF`` with no trailing command.
+    """True only for ``cat > /tmp/<token> <<'EOF'`` … ``EOF`` with no trailing command.
 
-    The opener is matched as a whole line so nothing rides before ``<<``; the
-    body closes on a bare ``EOF`` line (delimiter is fixed, so the close-point
-    matches bash); nothing executable may follow the terminator. Conservative on
-    any ambiguity (unterminated, trailing non-blank) → False so the caller vetoes.
+    The opener is matched as a whole line so nothing rides before ``<<``, and the
+    delimiter must be QUOTED (``'EOF'`` / ``"EOF"``) so bash performs no expansion
+    on the body — an unquoted ``<<EOF`` would expand (execute) substitutions in the
+    body, so it is not sanctioned (cpp#47). The body closes on a bare ``EOF`` line
+    (the closing delimiter is always unquoted in bash, regardless of opener
+    quoting, so the close-point is fixed and matches bash); nothing executable may
+    follow the terminator. Conservative on any ambiguity (unterminated, trailing
+    non-blank) → False so the caller vetoes.
     """
     lines = command.split("\n")
     if not _SANCTIONED_HEREDOC_OPENER_RE.match(lines[0]):
