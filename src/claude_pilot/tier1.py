@@ -355,6 +355,7 @@ def _is_safe_sub_command(sub: str) -> bool:
     return (
         is_safe_git_command(sub)
         or is_safe_build_command(sub)
+        or is_safe_make_command(sub)
         or is_safe_shell_command(sub)
         or is_safe_gh_command(sub)
         or is_safe_mika_dispatch(sub)
@@ -432,6 +433,31 @@ def is_safe_build_command(sub: str) -> bool:
         return True
 
     return False
+
+
+# ── Safe make targets ────────────────────────────────────────────────────────
+#
+# Closed-world allowlist (cpp#45 / mika#1639; architect session 783d4a04, n=3
+# permission-policy-errs-strict class): only explicitly-enumerated read-only
+# `make` targets auto-approve. `make verify-bundled-skills` is the bundled-skill
+# pre-merge gate (mika#1575) CI runs on every PR — read-only, no side effects
+# beyond stdout/exit code, same class as the cargo/npm verification commands.
+#
+# Stricter than _CARGO_RE: the pattern is full-anchored (`...\s*$`), so NO
+# trailing tokens are allowed. `make` arguments can override variables and
+# change behavior, so a trailing token must NOT ride the allowed prefix. Chain
+# safety (`make verify-bundled-skills && rm -rf ~`) is handled upstream by
+# _split_compound_command + the all-subs-safe check in is_safe_bash_command, not
+# here. Each new target needs its own evidence-gated ticket (cpp#34 discipline).
+
+SAFE_MAKE_TARGETS: frozenset[str] = frozenset({"verify-bundled-skills"})
+
+_MAKE_RE = re.compile(r"^\s*make\s+(\S+)\s*$")
+
+
+def is_safe_make_command(sub: str) -> bool:
+    m = _MAKE_RE.match(sub)
+    return bool(m and m.group(1) in SAFE_MAKE_TARGETS)
 
 
 # ── Safe shell commands ──────────────────────────────────────────────────────
