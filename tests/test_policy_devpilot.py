@@ -108,6 +108,50 @@ def test_guard_no_false_positive_on_var_expansion() -> None:
     assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is True
 
 
+# --- cpp#37: bash 5.3 K-style funsub ``${ command; }`` veto (mika-arch 783d4a04) ---
+# bash 5.3 added command substitution via ``${ … }`` / ``${| … }`` — same injection
+# power as ``$(…)``. It is vetoed structurally by the opener-token marker (``${``
+# followed by whitespace or ``|``), which never collides with ``${name}`` parameter
+# expansion (``${`` followed by an identifier/special char). No body lexing.
+
+
+def test_guard_vetoes_kstyle_funsub() -> None:
+    # cpp#37 AC1 + adversarial harness rows: every K-style funsub opener form vetoes.
+    # ``${ evil }`` (no internal delimiter) is the row that currently slips through
+    # because it doesn't trip ``_split_compound_command`` segmentation.
+    for cmd in [
+        "gh pr list --head ${ git branch --show-current; }",  # space + ``;``
+        "gh pr list --head ${ evil\n}",  # space + newline terminator
+        "gh pr list --base ${ evil }",  # no internal delimiter (AC1)
+        "echo ${| REPLY=evil; }",  # ``${|`` pipe form
+        "echo ${\tevil; }",  # tab after ``${``
+    ]:
+        assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is False, cmd
+
+
+def test_guard_allows_braced_param_expansion() -> None:
+    # cpp#37 AC2 — the braced ``${HOME}`` form is the one at risk from the funsub
+    # marker (the existing $HOME regression above is unbraced). It must still allow.
+    # Witnesses are commands already on the allow path that carry ``${name}``; the
+    # funsub marker (``${`` + whitespace/``|``) must not catch the identifier form.
+    # (NB: ``export PATH="${HOME}/…"`` is NOT a witness — its ``{}`` braces are
+    # vetoed by a pre-existing tier1 check independent of this change.)
+    for cmd in [
+        "echo ${HOME}",
+        "echo ${PATH}",
+        'echo "${HOME}/bin"',
+    ]:
+        assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is True, cmd
+
+
+def test_guard_funsub_marker_handles_truncated_opener() -> None:
+    # ``${`` at end of string (no following byte) must not crash the gate; the
+    # opener marker simply doesn't match, so the command proceeds to the normal path.
+    cmd = "echo ${"
+    # Whatever the downstream verdict, the call returns a bool and does not raise.
+    assert isinstance(_bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)), bool)
+
+
 # --- cpp#34: closed-world substitution-inner allowlist (mika-arch 783d4a04) ---
 # The blanket ``$(`` veto admits a narrow closed world of whole-token literals:
 # read-only git plumbing substitutions feeding a read-only outer command. Match

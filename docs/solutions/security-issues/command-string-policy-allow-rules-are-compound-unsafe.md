@@ -7,7 +7,7 @@ component: permission-classifier
 problem_type: security_issue
 category: security-issues
 severity: critical
-tags: [permissions, policy, bash, regex, heredoc, allow-list, rce, symlink, toctou, command-substitution, find-exec, ref-resolution, make, claude-pilot-25, claude-pilot-33, claude-pilot-34, claude-pilot-35, claude-pilot-43, claude-pilot-45]
+tags: [permissions, policy, bash, regex, heredoc, allow-list, rce, symlink, toctou, command-substitution, find-exec, ref-resolution, make, funsub, bash-5.3, claude-pilot-25, claude-pilot-33, claude-pilot-34, claude-pilot-35, claude-pilot-37, claude-pilot-43, claude-pilot-45]
 applies_when: "adding or reviewing any rule that decides allow/deny on a raw shell command string"
 ---
 
@@ -328,6 +328,48 @@ end-to-end compound path is what's locked (`tests/test_tier1.py`). Architect lin
 mika-arch session 783d4a04 (closed-world per-rule allowlist expansion; sibling
 claude-pilot#34/#35).
 
+### 9. The substitution marker set is closed over *known* shell forms — re-audit it when the shell grammar grows (bash 5.3 K-style funsub)
+
+The veto in §1/§4 enumerates the command-substitution forms it rejects: `$(`,
+backtick, `$'`. That list is only as complete as the shell grammar it was written
+against. **bash 5.3 (released late 2025) added a fourth form** — K-style command
+substitution `${ command; }` / `${| command; }` — with the same injection power as
+`$(…)`. It was not in the marker set, so on a bash 5.3 host
+`gh pr list --base ${ evil }` reached the allow path (it has no internal `;`, so it
+didn't even trip the incidental `_split_compound_command` segmentation). A
+substitution form the gate has never heard of is an open hole, not a closed world.
+
+The fix is the same shape as the rest of this doc — a **structural marker on the
+opening token, no lexing of the body** (cpp#37, mika-arch session `783d4a04`):
+
+```python
+# bash 5.3 distinguishes funsub from ${name} parameter expansion purely by the
+# byte after ${ : funsub requires whitespace (space/tab/newline) or `|`;
+# parameter expansion requires an identifier/special-param char. So this marker
+# can never collide with a legitimate ${HOME} / ${#arr[@]} / ${VAR:-x}.
+_FUNSUB_OPENER_RE = re.compile(r"\$\{[\s|]")
+# vetoed alongside backtick / $' , before any $( allowlist redaction runs.
+```
+
+Key points that make this safe and minimal:
+
+- **The discriminator is a single byte after `${`.** Verified empirically on GNU
+  bash 5.3.9: `${ HOME}` (space after `${`) is parsed as a *funsub opener*, not as
+  parameter expansion — so vetoing the whitespace/`|` form has no false positives on
+  real `${name}` references. `\s` is a deliberate superset of bash's blank set; any
+  over-match only ever vetoes (the safe direction).
+- **No funsub allowlist.** Unlike `$(`, there is no closed-world allowlist for
+  `${…}` funsubs — none is needed today, and adding one is a separate
+  evidence-gated ticket, never an inline edit (§4 discipline).
+- **Pre-existing, unrelated:** the braces in `export PATH="${HOME}/…"` are already
+  vetoed by a separate tier1 check, independent of this marker — don't conflate it
+  with funsub handling.
+
+Generalization: when a marker set encodes "the dangerous forms of X", record the
+*grammar version* it was audited against, and re-audit on a major shell/runtime
+bump. The symmetric `permission_pre_classifier.rs` in mika (see Related) is the same
+class and the same re-audit candidate.
+
 ## When to Apply
 
 - Adding/reviewing any `permissions.yaml` rule, or any code deciding allow/deny on
@@ -343,6 +385,9 @@ claude-pilot#34/#35).
   by the command's own argument grammar (full-anchor when a trailing token can change
   behavior, as `make` does), inherit chain safety from the splitter, keep the target set
   closed, and pin with `is_safe_bash_command`-level tests (§8).
+- A major shell/runtime version bump: re-audit the substitution marker set against the
+  new grammar — bash 5.3's K-style funsub `${ … }` was a new injection form the
+  original `$(`/backtick/`$'` set did not cover (§9).
 - Reviewing `tier1.py` / `policy.py` / `permissions.py` in claude-pilot.
 
 ## Related
@@ -366,3 +411,10 @@ claude-pilot#34/#35).
   write target** (`/tmp` heredoc, and every structural write rule —
   `bash-cp-mv`/`bash-mkdir`/`bash-git-show-redirect`) is a runtime concern
   outside static policy scope (see #5; closing it policy-wide = cpp#38).
+- **Known-open gap (filed cpp#47):** the sanctioned `cat > /tmp/<token> <<EOF`
+  exception (§2) returns BEFORE the §1/§4/§8 substitution-marker veto and admits an
+  *unquoted* `EOF` delimiter, so `$(…)` / backtick / `${ …; }` funsub in the heredoc
+  **body** expand and auto-approve (reproduced on bash 5.3.9). Distinct from the
+  accepted in-worktree-execution residual above: the sanctioned heredoc is *designed
+  to be inert*. Fix shape (quoted-delimiter restriction vs body-scan) needs an
+  architect call — see cpp#47.
