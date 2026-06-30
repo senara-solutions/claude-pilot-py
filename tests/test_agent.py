@@ -474,3 +474,110 @@ async def test_1409_run_agent_passes_system_prompt_into_options(
     assert isinstance(sp, dict)
     assert sp["type"] == "preset" and sp["preset"] == "claude_code"
     assert "-exec" in sp["append"] and "Grep" in sp["append"]
+
+
+# ── cpp#55: _extract_session_id / _extract_model read SystemMessage.data ──────
+
+
+def test_extract_session_id_reads_nested_data() -> None:
+    """SDK 0.2.x nests session_id under .data — the extractor must read it."""
+    msg = SystemMessage(subtype="init", data={"session_id": "abc-123"})
+    assert agent_module._extract_session_id(msg) == "abc-123"
+
+
+def test_extract_model_reads_nested_data() -> None:
+    msg = SystemMessage(subtype="init", data={"model": "claude-x"})
+    assert agent_module._extract_model(msg) == "claude-x"
+
+
+def test_extract_falls_back_to_top_level_attr() -> None:
+    """Back-compat: an object exposing top-level session_id/model attrs and no
+    usable .data still resolves (guards a future SDK that reverts the nesting,
+    and any mock built on the pre-0.2 shape)."""
+    from types import SimpleNamespace
+
+    stub = SimpleNamespace(session_id="top-sess", model="top-model")
+    assert agent_module._extract_session_id(stub) == "top-sess"  # type: ignore[arg-type]
+    assert agent_module._extract_model(stub) == "top-model"  # type: ignore[arg-type]
+
+
+def test_extract_missing_both_returns_none() -> None:
+    msg = SystemMessage(subtype="init", data={})
+    assert agent_module._extract_session_id(msg) is None
+    assert agent_module._extract_model(msg) is None
+
+
+def test_extract_non_string_nested_value_returns_none() -> None:
+    """Type narrowing holds: a non-string nested value yields None, not the int."""
+    msg = SystemMessage(subtype="init", data={"session_id": 42, "model": 7})
+    assert agent_module._extract_session_id(msg) is None
+    assert agent_module._extract_model(msg) is None
+
+
+# ── cpp#54: ResultMessage.api_error_status flows into ResultJson ──────────────
+
+
+def _result_with_api_error(status: int) -> ResultMessage:
+    return ResultMessage(
+        subtype="error",
+        duration_ms=100,
+        duration_api_ms=50,
+        is_error=True,
+        num_turns=1,
+        session_id="sess_test",
+        total_cost_usd=0.0,
+        api_error_status=status,
+    )
+
+
+@pytest.mark.asyncio
+async def test_api_error_status_flows_to_result_json(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """cpp#54: a ResultMessage carrying api_error_status=429 must surface that
+    value on the emitted ResultJson line for deterministic downstream
+    classification."""
+    import json
+
+    _install_fake_client(monkeypatch, [_init(), _result_with_api_error(429)])
+
+    await run_agent(
+        prompt="test",
+        cwd=".",
+        verbose=False,
+        task_id="task_api_err",
+        permission_handler=_noop_permission,
+        guardrails=SessionGuardrails(_config()),
+    )
+
+    captured = capsys.readouterr()
+    json_lines = [line for line in captured.out.splitlines() if line.startswith("{")]
+    payload = json.loads(json_lines[0])
+    assert payload["api_error_status"] == 429, payload
+
+
+@pytest.mark.asyncio
+async def test_api_error_status_absent_omits_field(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Absent path: the default _result() fixture has no api_error_status, so
+    the field is omitted from the JSON line (exclude_none back-compat)."""
+    import json
+
+    _install_fake_client(monkeypatch, [_init(), _result()])
+
+    await run_agent(
+        prompt="test",
+        cwd=".",
+        verbose=False,
+        task_id="task_no_api_err",
+        permission_handler=_noop_permission,
+        guardrails=SessionGuardrails(_config()),
+    )
+
+    captured = capsys.readouterr()
+    json_lines = [line for line in captured.out.splitlines() if line.startswith("{")]
+    payload = json.loads(json_lines[0])
+    assert "api_error_status" not in payload, payload

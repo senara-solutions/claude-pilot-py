@@ -398,6 +398,13 @@ def create_permission_handler(
             tool_input=tool_input,
             tool_use_id=ctx.tool_use_id or "",
             agent_id=ctx.agent_id,
+            # cpp#56: additive ToolPermissionContext enrichment. getattr-guarded
+            # so an SDK minor lacking a field yields None instead of crashing.
+            decision_reason=getattr(ctx, "decision_reason", None),
+            blocked_path=getattr(ctx, "blocked_path", None),
+            title=getattr(ctx, "title", None),
+            display_name=getattr(ctx, "display_name", None),
+            description=getattr(ctx, "description", None),
         )
 
         log_relay_send(tool_name)
