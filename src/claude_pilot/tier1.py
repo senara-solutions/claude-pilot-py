@@ -605,6 +605,18 @@ _FIND_WRITE_RE = re.compile(r"-(?:fprintf|fprint0|fprint|fls)\b")
 _FIND_EXEC_INNER_RE = re.compile(r"-(?:execdir|exec|okdir|ok)\b\s+(\S+)")
 
 
+def _contains_substitution(sub: str) -> bool:
+    """True if *sub* contains any command-substitution marker (`$(`, backtick,
+    `$'`). Used as a defense-in-depth guard by the exec-class allowlist gates
+    (`_is_safe_find_command`, `_is_safe_xargs_command`): a read-only `find`/`xargs`
+    invocation never needs substitution, so its presence smuggles execution.
+    Shared so the two gates cannot drift. Note `is_safe_bash_command` also runs
+    `contains_unquoted_metacharacter` first, which catches unquoted and
+    double-quoted substitution; this substring check additionally vetoes the
+    single-quoted (inert) form — the safe-direction over-block."""
+    return "$(" in sub or "`" in sub or "$'" in sub
+
+
 def _is_safe_find_command(sub: str) -> bool:
     """Decide whether a `find` invocation is safe to auto-approve (cpp#33).
 
@@ -637,22 +649,29 @@ def _is_safe_find_command(sub: str) -> bool:
     if not inner_commands:
         return True  # pure search — no exec-class clause, no -delete
 
-    if "$(" in sub or "`" in sub or "$'" in sub:
+    if _contains_substitution(sub):
         return False
 
     return all(inner in FIND_EXEC_SAFE_COMMANDS for inner in inner_commands)
 
 
-# `xargs` short flags that take a SEPARATE value token (e.g. `-I {}`, `-n 1`,
-# `-d ,`, `-P 4`). When one of these appears as its own token, the NEXT token is
-# its value, not the inner command — skip both. Attached forms (`-n1`, `-I{}`,
-# `-P4`) and value-less flags (`-0`, `-r`, `-t`, `-x`, `-p`) are a single token
-# and skip just themselves. `-e`/`-i`/`-l` are deprecated optional-value forms;
-# treating them as value-taking over-blocks the rare separate-value spelling,
-# which is the safe failure mode. This is structural token-skipping, NOT a bash
-# lexer — we never interpret the inner command's own arguments.
+# `xargs` short flags that take a REQUIRED SEPARATE value token (e.g. `-I {}`,
+# `-n 1`, `-d ,`, `-P 4`). When one of these appears as its own token, the NEXT
+# token is its value, not the inner command — skip both. Attached forms (`-n1`,
+# `-I{}`, `-P4`) and value-less flags (`-0`, `-r`, `-t`, `-x`, `-p`) are a single
+# token and skip just themselves.
+#
+# This set lists ONLY getopt *required-argument* short flags. The deprecated
+# `-e[eof]`/`-i[replace]`/`-l[lines]` are getopt *optional-argument* forms — an
+# optional argument is taken ONLY when attached (`-i{}`), NEVER as a separate
+# token. They are deliberately EXCLUDED: if they were here, `xargs -i rm cat`
+# would skip `-i` AND `rm` (treating the real command `rm` as `-i`'s value) and
+# allow on `cat` — a confirmed auto-approval of `rm` (cpp#40 security review, P0).
+# Excluded, they fall to the single-token skip below, so `xargs -i rm cat`
+# correctly evaluates `rm` and denies. This is a parser-arity contract with GNU
+# getopt; over-block is the safe direction, NEVER under-block.
 _XARGS_VALUE_FLAGS: frozenset[str] = frozenset(
-    {"-a", "-d", "-E", "-I", "-L", "-n", "-P", "-s", "-e", "-i", "-l"}
+    {"-a", "-d", "-E", "-I", "-L", "-n", "-P", "-s"}
 )
 
 
@@ -676,7 +695,7 @@ def _is_safe_xargs_command(sub: str) -> bool:
     - a bare `xargs` with no inner command (defaults to `echo`, but ambiguous →
       over-block is the safe default).
     """
-    if "$(" in sub or "`" in sub or "$'" in sub:
+    if _contains_substitution(sub):
         return False
 
     tokens = sub.split()
@@ -689,9 +708,20 @@ def _is_safe_xargs_command(sub: str) -> bool:
         if tok == "--":  # explicit end-of-options; next token is the command
             i += 1
             break
-        if tok.startswith("--"):  # GNU long option; value (if any) rides `=form`
-            i += 1
-            continue
+        if tok.startswith("--"):
+            # GNU long option. A getopt long option's value may be SEPARATE
+            # (`--arg-file cat`) or `=form` (`--arg-file=cat`); we cannot know a
+            # given option's arity without a full getopt table, and assuming
+            # `=form`-only let `xargs --arg-file cat rm` skip just `--arg-file`,
+            # land on `cat`, and allow while real xargs runs `rm` (cpp#40 security
+            # review, P0). `=form` packs the value into this one token, so the
+            # NEXT token is reliably the command/another flag → skip one. A BARE
+            # `--long` has unknowable arity → deny (over-block). The inner command
+            # may still follow `--` or an `=form` option.
+            if "=" in tok:
+                i += 1
+                continue
+            return False
         if tok.startswith("-"):
             if tok in _XARGS_VALUE_FLAGS:  # separate-value short flag → skip value
                 i += 2
