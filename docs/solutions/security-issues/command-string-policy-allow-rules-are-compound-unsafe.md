@@ -7,7 +7,7 @@ component: permission-classifier
 problem_type: security_issue
 category: security-issues
 severity: critical
-tags: [permissions, policy, bash, regex, heredoc, allow-list, rce, symlink, toctou, command-substitution, find-exec, xargs, ugrep, double-quote, ref-resolution, make, funsub, bash-5.3, worktree-containment, control-plane, claude-pilot-25, claude-pilot-33, claude-pilot-34, claude-pilot-35, claude-pilot-37, claude-pilot-38, claude-pilot-40, claude-pilot-41, claude-pilot-42, claude-pilot-43, claude-pilot-44, claude-pilot-45, claude-pilot-47]
+tags: [permissions, policy, bash, regex, heredoc, allow-list, rce, symlink, toctou, command-substitution, find-exec, xargs, ugrep, double-quote, ref-resolution, make, funsub, bash-5.3, worktree-containment, control-plane, claude-pilot-25, claude-pilot-33, claude-pilot-34, claude-pilot-35, claude-pilot-37, claude-pilot-38, claude-pilot-40, claude-pilot-41, claude-pilot-42, claude-pilot-43, claude-pilot-44, claude-pilot-45, claude-pilot-47, claude-pilot-60, command-builtin]
 applies_when: "adding or reviewing any rule that decides allow/deny on a raw shell command string"
 ---
 
@@ -306,6 +306,38 @@ are admitted. Over-block on arity uncertainty, never under-block. Lesson: skippi
 tokens by flag class is parsing; hold it to the same "no parser differential" bar as
 §2/§4, and pin it with executed-exploit review (§3) against the **real** `getopt`,
 not your model of it.
+
+**Third front-end, recursion instead of a closed-world set (claude-pilot#60).** The
+`command` builtin is the same *run-this-other-command* shape as `find -exec` and
+`xargs`, but it was on `SAFE_SHELL_COMMANDS` **unguarded** — the entry's comment
+claimed the intent was only the read-only `command -v <name>` lookup, but bare
+membership admitted any `command <x>`. `command cp src .git/hooks/x` / `command tee
+.git/x` / `command mkdir .claude/x` all auto-approved at Tier 1, re-opening exactly
+the control-plane-write holes the cpp#42 destination validator closes for bare
+`cp`/`mv`/`mkdir` (`command tee <path>` is additionally a write primitive not
+otherwise tier1-reachable). The unguarded entry is the *same class* as the original
+unguarded `find -exec`: safe-listing a command-wrapper without restricting the inner
+command lets the inner command run unchecked. The fix special-cases `command` in
+`is_safe_shell_command` exactly like `find`/`xargs` (`_is_safe_command_builtin`), but
+the guard is **recursion, not a closed-world allowlist**: because `command <x>` runs
+`<x>` with no semantics of its own beyond bypassing functions/aliases, the soundest
+guard re-classifies `<x>` through `is_safe_shell_command` itself — so `command` is
+*by construction* no more permissive than the inner command alone (`command grep foo`
+allows because `grep foo` does; `command cp …` denies because `cp` is not safe-listed).
+The only special case is the `command -v`/`-V` **lookup** form, which is allowed
+directly (it describes, never executes, its target) — this is what preserves the
+original intent and the dev-pilot `command -v <tool> && <tool>` idiom. Two design
+points worth pinning: (1) the recursion is deliberately the *shell* allowlist, not
+the full `_is_safe_sub_command` dispatch — so `command cargo test`/`command git
+status` over-block (an extra relay round-trip, never a hole), the same read-only
+posture as find/xargs; (2) a leading flag that is **not** `-v`/`-V` (e.g. `-p`, which
+runs with a default PATH and is NOT a lookup) denies closed-world — never widen the
+flag set without an executed-exploit AC (§3). Recursion terminates because each level
+strips the leading `command` token. The general lesson across all three front-ends
+(`find -exec`, `xargs`, `command`): **when a safe-listed command's whole job is to run
+another command, the allowlist entry is a marker, not the guard — the guard is a
+sub-classifier (closed-world set or recursion) that is provably no more permissive
+than running the inner command directly.**
 
 ### 7. A regex's syntactic shape is not a runtime-identity guarantee — document what the matched bytes can REFER TO, not what they look like
 

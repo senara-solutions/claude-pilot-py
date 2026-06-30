@@ -561,7 +561,12 @@ SAFE_SHELL_COMMANDS: frozenset[str] = frozenset({
     # TIER3 command-substitution blockers ($(...), backticks, <(...)) that
     # run on the raw compound before splitting.
     "cd",
-    # `command -v <name>` is equivalent to `which <name>`; already safe.
+    # `command` is NOT read-only on its own — it runs an inner command, bypassing
+    # shell functions/aliases. Membership here only passes the SAFE_SHELL_COMMANDS
+    # gate; the actual safety decision is made by the `command` special-case in
+    # is_safe_shell_command (cpp#60): the read-only `command -v <name>` lookup, or
+    # an inner command that is itself tier1-safe (recursive) — exactly like `find`
+    # (_is_safe_find_command) and `xargs` (_is_safe_xargs_command) are special-cased.
     "command",
 })
 
@@ -762,6 +767,67 @@ def _is_safe_xargs_command(sub: str) -> bool:
     return False  # no inner command found → deny
 
 
+def _is_safe_command_builtin(sub: str) -> bool:
+    """Decide whether a `command` builtin invocation is safe to auto-approve (cpp#60).
+
+    `command [-pVv] <name> [arg ...]` runs <name> while bypassing shell functions
+    and aliases — so, exactly like `find -exec` (cpp#33) and `xargs` (cpp#40),
+    safe-listing `command` without restricting the inner command lets that inner
+    command run unchecked. Membership of `command` in SAFE_SHELL_COMMANDS only
+    passes the gate; THIS function is the actual guard.
+
+    Allow iff:
+    - the read-only lookup form `command -v <name>` / `command -V <name>` — the
+      `which`-equivalent the original entry intended; preserves the dev-pilot
+      footprint (`command -v lefthook`, `command -v cargo && cargo test`), OR
+    - the inner command is itself a tier1-safe SHELL command, decided by recursing
+      through `is_safe_shell_command`. So `command` is never MORE permissive than
+      the inner command alone (`command grep foo` allows because `grep foo` does;
+      `command cp …`/`command tee …`/`command mkdir …` deny because the bare forms
+      do). It is intentionally NARROWER: the recursion re-enters only the shell
+      allowlist (+ the find/xargs/command sub-guards), NOT the full
+      `_is_safe_sub_command` dispatch — so `command cargo test`/`command git status`/
+      `command gh …` deny even though their bare forms auto-approve via the build/
+      git/gh allowlists. That over-block (an extra relay round-trip, never a hole)
+      mirrors the read-only posture of `find`/`xargs`; the live dev-pilot idiom is
+      the `command -v <tool> && <tool>` lookup form above, which is unaffected.
+
+    Denies:
+    - any command substitution (`$(`, backtick, `$'`) anywhere — a read-only
+      `command …` never needs it; its presence smuggles execution (shared
+      `_contains_substitution`, mirrors find/xargs; also caught at the scanner
+      layer by cpp#41).
+    - a leading flag other than `-v`/`-V` (e.g. `-p`, which runs with a default
+      PATH and is NOT a read-only lookup; `--help`). Closed-world: widening needs
+      an evidence-gated ticket, never a hunch (cpp#34 discipline).
+    - a bare `command` with no inner token (ambiguous → over-block).
+    - `command sh -c …`/`command bash -c …`/`command sudo …` and every other
+      non-safe-listed inner command, via the recursion (sh/bash/sudo are not in
+      SAFE_SHELL_COMMANDS; sh -c/bash -c also caught by the TIER3 patterns).
+
+    Recursion terminates: each call strips the leading `command` token, so the
+    re-classified string strictly shrinks.
+    """
+    if _contains_substitution(sub):
+        return False
+
+    tokens = sub.split()
+    if not tokens or tokens[0] != "command":
+        return False
+
+    rest = tokens[1:]
+    if not rest:
+        return False  # bare `command` — no inner command to classify
+
+    if rest[0] in ("-v", "-V"):
+        return True  # read-only lookup form (which-equivalent)
+
+    if rest[0].startswith("-"):
+        return False  # closed-world: -p/--help/etc. are not read-only lookups
+
+    return is_safe_shell_command(" ".join(rest))
+
+
 def is_safe_shell_command(sub: str) -> bool:
     match = _FIRST_WORD_RE.match(sub)
     if not match:
@@ -776,6 +842,9 @@ def is_safe_shell_command(sub: str) -> bool:
 
     if cmd == "xargs":
         return _is_safe_xargs_command(sub)
+
+    if cmd == "command":
+        return _is_safe_command_builtin(sub)
 
     return True
 
