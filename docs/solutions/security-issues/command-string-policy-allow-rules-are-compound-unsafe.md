@@ -7,7 +7,7 @@ component: permission-classifier
 problem_type: security_issue
 category: security-issues
 severity: critical
-tags: [permissions, policy, bash, regex, heredoc, allow-list, rce, symlink, toctou, command-substitution, find-exec, ref-resolution, claude-pilot-25, claude-pilot-33, claude-pilot-34, claude-pilot-35, claude-pilot-43]
+tags: [permissions, policy, bash, regex, heredoc, allow-list, rce, symlink, toctou, command-substitution, find-exec, ref-resolution, make, claude-pilot-25, claude-pilot-33, claude-pilot-34, claude-pilot-35, claude-pilot-43, claude-pilot-45]
 applies_when: "adding or reviewing any rule that decides allow/deny on a raw shell command string"
 ---
 
@@ -287,6 +287,47 @@ This is the source-side twin of §5's destination-side corollary ("don't claim a
 stronger guarantee than the mechanism delivers"); both were caught post-merge by
 executed/adversarial review (§3), not by reading the diff.
 
+### 8. Adding a new tier1 command class: anchor strictness scales with the command's argument surface
+
+`tier1.py`'s standalone allow-list (`is_safe_build_command`, `is_safe_shell_command`,
+…) admits whole command classes by `^\s*<cmd>\s+(\S+)` + a frozenset membership
+check on the captured token. When adding a class (claude-pilot#45 added
+`make verify-bundled-skills`), two calibration choices are load-bearing:
+
+1. **Anchor as strictly as the command's argument grammar demands — not by copying
+   a sibling's regex.** `_CARGO_RE`/`_NPM_RUN_RE` are *prefix* matches (`^\s*cargo\s+(\S+)`)
+   that intentionally admit trailing flags (`cargo build --release`) — safe because
+   cargo's flags don't change the trust character of the run. `make` is different: a
+   trailing `FOO=bar` token overrides a Makefile variable and can change *what the
+   target does*. So `_MAKE_RE` is **full-anchored** (`^\s*make\s+(\S+)\s*$`) — no
+   trailing token may ride the allowed target. The right anchor is a property of the
+   command, decided per class; "mirror the adjacent rule" is the wrong default.
+
+2. **Chain safety is inherited from the splitter — do not re-implement it in the
+   matcher.** `is_safe_bash_command` already runs `contains_unquoted_metacharacter`
+   + `is_tier3_dangerous` on the raw string, then requires *every*
+   `_split_compound_command` segment to be independently safe. So
+   `make verify-bundled-skills && rm -rf ~` dies three ways over (substitution veto,
+   tier3 `rm -rf`, and the `rm` segment failing the allow-list) with **zero** make-specific
+   logic. A new class's matcher only has to decide the single-segment case correctly;
+   adding redundant in-regex chain guards invites a parser differential (the §2 lesson).
+
+3. **A closed frozenset of one is the correct shape, and over-strict denials are the
+   correct failure mode.** Only `verify-bundled-skills` is enumerated; `make deploy`
+   and every other target route to the relay. The full anchor also denies otherwise-benign
+   `make verify-bundled-skills 2>/dev/null` (the fd-redirect strip lives only in
+   `is_tier3_dangerous`, not the matcher) — a false-negative on *approval*, which is the
+   safe direction. Each new target is an evidence-gated follow-up (the same discipline as
+   §4's substitution allowlist), not a generalization to "any read-only make target."
+
+An independent adversarial pass (20 probe strings: trailing-token, `&&`/`;`/`|`/`\n`/`\r`
+chains, `$(`/backtick, case, tab/space, quote-hidden separators) broke none — the
+closed-world frozenset + full anchor + inherited splitter held on every class. Pin the
+behavior with `is_safe_bash_command`-level tests (not just the matcher), so the
+end-to-end compound path is what's locked (`tests/test_tier1.py`). Architect lineage:
+mika-arch session 783d4a04 (closed-world per-rule allowlist expansion; sibling
+claude-pilot#34/#35).
+
 ## When to Apply
 
 - Adding/reviewing any `permissions.yaml` rule, or any code deciding allow/deny on
@@ -298,6 +339,10 @@ executed/adversarial review (§3), not by reading the diff.
   exec/write flag (§6a — `rg --pre`, `ugrep --filter`, GNU vs non-GNU provider),
   and if the command has multiple actions (like `find`), confirm the guard
   enumerates its whole mutating action set and denies the unknown (§6b).
+- Adding a new standalone command class to `tier1.py`'s allow-list: choose the anchor
+  by the command's own argument grammar (full-anchor when a trailing token can change
+  behavior, as `make` does), inherit chain safety from the splitter, keep the target set
+  closed, and pin with `is_safe_bash_command`-level tests (§8).
 - Reviewing `tier1.py` / `policy.py` / `permissions.py` in claude-pilot.
 
 ## Related

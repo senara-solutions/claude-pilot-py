@@ -20,6 +20,7 @@ from claude_pilot.tier1 import (
     contains_unquoted_metacharacter,
     is_safe_bash_command,
     is_safe_git_command,
+    is_safe_make_command,
     is_safe_mika_dispatch,
     is_safe_shell_command,
     is_tier1_auto_approve,
@@ -190,6 +191,7 @@ def test_eval_dollar_paren_still_denied() -> None:
         "cargo test",
         "cargo clippy --all-targets",
         "cargo build --release",
+        "make verify-bundled-skills",
         "npm ci",
         "npm run build",
         "npm test",
@@ -218,6 +220,40 @@ def test_git_push_to_main_denied() -> None:
 
 def test_git_unknown_subcommand_denied() -> None:
     assert is_safe_git_command("git obliterate") is False
+
+
+# ── make-specific (cpp#45 / mika#1639; architect 783d4a04) ───────────────────
+#
+# Closed-world `make` allowlist: only `make verify-bundled-skills` auto-approves.
+# Assert through is_safe_bash_command (the public entry) so the compound-split +
+# all-subs-safe path is exercised end to end.
+
+
+def test_make_verify_bundled_skills_allowed() -> None:
+    """AC1: the read-only bundled-skill pre-merge gate auto-approves."""
+    assert is_safe_bash_command("make verify-bundled-skills") is True
+
+
+def test_make_verify_bundled_skills_chained_denied() -> None:
+    """AC2: a dangerous tail in the same compound is denied (the rm sub fails)."""
+    assert is_safe_bash_command("make verify-bundled-skills && rm -rf ~") is False
+
+
+def test_make_uppercase_denied() -> None:
+    """AC3: the matcher keys on literal lowercase `make` — `MAKE` does not match."""
+    assert is_safe_bash_command("MAKE verify-bundled-skills") is False
+
+
+def test_make_verify_with_trailing_arg_denied() -> None:
+    """AC4: the full-string anchor rejects any trailing token."""
+    assert is_safe_bash_command("make verify-bundled-skills extra-arg") is False
+
+
+def test_make_deploy_denied() -> None:
+    """AC5: unenumerated targets — notably the side-effecting `make deploy` — stay denied."""
+    assert is_safe_bash_command("make deploy") is False
+    assert is_safe_make_command("make deploy") is False
+    assert is_safe_make_command("make verify-bundled-skills") is True
 
 
 # ── shell-specific ───────────────────────────────────────────────────────────
