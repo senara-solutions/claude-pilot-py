@@ -248,10 +248,28 @@ def test_guard_vetoes_heredoc_leading_edge_chain() -> None:
         assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is False, cmd
 
 
-def test_guard_allows_heredoc_body_with_substitution_text() -> None:
-    # The heredoc BODY is inert data — `$(...)`/`rm` as literal script text is fine.
-    cmd = "cat > /tmp/x.txt <<EOF\nfoo=$(date)\nrm -rf /tmp/build\nEOF"
-    assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is True
+def test_guard_allows_quoted_heredoc_body_with_substitution_text() -> None:
+    # cpp#47 — a QUOTED delimiter makes bash treat the body as literal text (no
+    # expansion, verified on bash 5.3.9 for both `'EOF'` and `"EOF"`), so `$(...)`
+    # / `rm` as script text is provably inert and the sanctioned write is honored.
+    for cmd in [
+        "cat > /tmp/x.txt <<'EOF'\nfoo=$(date)\nrm -rf /tmp/build\nEOF",
+        'cat > /tmp/x.txt <<"EOF"\nfoo=$(date)\nEOF',
+        "cat > /tmp/x.txt <<-'EOF'\nfoo=$(date)\nEOF",  # `<<-` dash variant, quoted → inert
+    ]:
+        assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is True, cmd
+
+
+def test_guard_vetoes_unquoted_heredoc_body_substitution() -> None:
+    # cpp#47 — with an UNQUOTED `<<EOF` bash EXPANDS the body, so a substitution
+    # there executes during heredoc expansion. The sanctioned exception now admits
+    # only a quoted delimiter, so every unquoted-body-substitution form vetoes.
+    for cmd in [
+        "cat > /tmp/x.txt <<EOF\nfoo=$(date)\nEOF",  # command substitution
+        "cat > /tmp/x.txt <<EOF\nfoo=`id`\nEOF",  # backtick substitution
+        "cat > /tmp/x.txt <<EOF\nfoo=${ id; }\nEOF",  # bash 5.3 K-style funsub
+    ]:
+        assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is False, cmd
 
 
 def test_guard_vetoes_heredoc_delimiter_desync() -> None:

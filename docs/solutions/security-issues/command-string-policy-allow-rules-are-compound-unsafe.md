@@ -7,7 +7,7 @@ component: permission-classifier
 problem_type: security_issue
 category: security-issues
 severity: critical
-tags: [permissions, policy, bash, regex, heredoc, allow-list, rce, symlink, toctou, command-substitution, find-exec, ref-resolution, make, funsub, bash-5.3, claude-pilot-25, claude-pilot-33, claude-pilot-34, claude-pilot-35, claude-pilot-37, claude-pilot-43, claude-pilot-45]
+tags: [permissions, policy, bash, regex, heredoc, allow-list, rce, symlink, toctou, command-substitution, find-exec, ref-resolution, make, funsub, bash-5.3, claude-pilot-25, claude-pilot-33, claude-pilot-34, claude-pilot-35, claude-pilot-37, claude-pilot-43, claude-pilot-45, claude-pilot-47]
 applies_when: "adding or reviewing any rule that decides allow/deny on a raw shell command string"
 ---
 
@@ -81,6 +81,22 @@ General principle: when a static check must agree with a shell's parse, **fix th
 variable rather than parse it** (or shell out to a real lexer), and pin it with a
 **differential test against real bash** (run the construct, assert the gate denies
 iff bash would execute something dangerous).
+
+**The close-point and body-expansion are two separate axes — fixing one does not
+fix the other (cpp#47).** The hard-coded-`EOF` fix above made the *terminator*
+safe (the gate's close-point can't diverge from bash's). But the sanctioned shape
+also originally admitted an **unquoted** delimiter (`<<EOF`), and with an unquoted
+delimiter bash **expands the heredoc body** — so `$(…)` / backtick / `${ …; }`
+funsub in the body *execute* during expansion (verified on bash 5.3.9), while the
+`<<` early-return auto-approves the command before the substitution-marker veto
+ever runs. The fix is to require a **quoted** delimiter (`<<'EOF'` / `<<"EOF"`;
+either form disables all body expansion, verified on bash 5.3.9), making the body
+provably inert — the property the "inert /tmp write" exception always assumed.
+Writing literal `$(…)` *content* to a file requires a quoted delimiter anyway, so
+no legitimate use is lost; the bare-`EOF` alternative was dropped from
+`_SANCTIONED_HEREDOC_OPENER_RE`. Lesson: when a structural exception's safety rests
+on a body being *data*, pin the syntactic property that actually makes it data
+(here, delimiter quoting) — don't infer inertness from the close-point alone.
 
 ### 3. Permission-classifier changes need executed-exploit review, not reasoning-only review
 
