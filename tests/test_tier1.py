@@ -16,6 +16,7 @@ import pytest
 from claude_pilot.tier1 import (
     DENIED_BASH_PATTERNS_HINT,
     INTRA_PLATFORM_AGENTS,
+    _is_safe_command_builtin,
     _is_safe_xargs_command,
     _split_compound_command,
     contains_unquoted_metacharacter,
@@ -522,6 +523,129 @@ def test_denied_hint_no_longer_lists_xargs_categorically() -> None:
     assert "no longer crashes" in DENIED_BASH_PATTERNS_HINT
     # The old blanket bullet ("`xargs`, `eval`, `bash -c`, `sh -c`") is gone.
     assert "`xargs`, `eval`, `bash -c`, `sh -c`" not in DENIED_BASH_PATTERNS_HINT
+
+
+# ── cpp#60: command builtin recursive guard ──────────────────────────────────
+#
+# `command` is a run-this-other-command wrapper (bypasses shell functions/aliases),
+# so safe-listing it unguarded let `command cp/tee/mkdir` auto-approve at Tier 1 —
+# re-opening the cpp#42 control-plane-write holes. The `command` entry stays in
+# SAFE_SHELL_COMMANDS as a marker; `_is_safe_command_builtin` is the real guard
+# (same architectural move as cpp#33 find-exec / cpp#40 xargs). Allow iff the
+# read-only `command -v`/`-V` lookup OR an inner command that is itself a tier1-safe
+# SHELL command (recursion re-enters is_safe_shell_command — intentionally narrower
+# than the full _is_safe_sub_command dispatch; see test_command_builtin_narrower_than_full_tier1).
+# Assertions run against is_safe_bash_command (the real compound-split auto-approve
+# entrypoint), not just the helper.
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Read-only lookup form (R2 — preserves the dev-pilot footprint).
+        "command -v gh",
+        "command -v cargo",
+        "command -v lefthook",
+        "command -V printf",
+        "command -v cargo && cargo test",   # compound: lookup + safe build cmd
+        # Recursive: inner command is itself tier1-safe (R3 — pass-through).
+        "command grep foo file",
+        "command cat file",
+        "command ls -la",
+    ],
+)
+def test_command_builtin_allowed(command: str) -> None:
+    assert is_safe_bash_command(command) is True, command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Non-safe-listed inner command (R1 — the exploit class).
+        "command cp src dst",
+        "command tee /etc/passwd",          # arbitrary file-write primitive
+        "command mkdir foo",
+        "command rm x",
+        # Shell wrapper / privilege escalation (R4 — AC4 parity with cpp#33).
+        "command sh -c 'rm -rf /'",
+        "command bash -c id",
+        "command sudo whoami",
+        # Closed-world flag discipline (KTD-3): only -v/-V are read-only lookups.
+        "command -p cp src dst",            # -p runs with default PATH, not read-only
+        "command --help",
+        # Bare command — no inner token to classify (over-block).
+        "command",
+        # Recursion into the nested find/xargs guards must still deny.
+        "command find . -delete",
+        "command xargs rm",
+        # Substitution guard (R5).
+        "command grep `id` file",
+        'command grep "$(id)" file',
+    ],
+)
+def test_command_builtin_denied(command: str) -> None:
+    assert is_safe_bash_command(command) is False, command
+
+
+def test_command_builtin_exploit_regression() -> None:
+    """cpp#60 founding exploit: `command cp …` writing into the control plane must
+    no longer auto-approve at Tier 1 (it now routes to policy / the cpp#42
+    destination validator). Asserted at is_tier1_auto_approve, matching the issue
+    body's executed reproduction."""
+    assert (
+        is_tier1_auto_approve(
+            "Bash", {"command": "command cp src .git/hooks/x"}, "/tmp"
+        )
+        is False
+    )
+    # The honest form was already denied (control); the `command` wrapper now
+    # matches it instead of bypassing.
+    assert (
+        is_tier1_auto_approve("Bash", {"command": "cp src .git/hooks/x"}, "/tmp")
+        is False
+    )
+
+
+def test_command_builtin_substitution_guard_denies_single_quoted() -> None:
+    """The `_is_safe_command_builtin` substring substitution guard denies
+    single-quoted (inert) `$(`/backtick directly — `contains_unquoted_metacharacter`
+    does NOT catch single-quoted forms (mirrors the xargs guard). Over-block is the
+    safe direction. A clean read-only form still passes the helper directly."""
+    assert _is_safe_command_builtin("command grep '$(id)' file") is False
+    assert _is_safe_command_builtin("command grep '`id`' file") is False
+    assert _is_safe_command_builtin("command -v gh") is True
+    assert _is_safe_command_builtin("command grep foo file") is True
+
+
+def test_command_builtin_deny_not_via_tier3() -> None:
+    """Layer placement: `command cp …` is denied at the allow-list layer, NOT by
+    a TIER3 pattern — the guard is the recursion, not the denylist."""
+    assert is_tier3_dangerous("command cp src dst") is False
+    assert is_safe_bash_command("command cp src dst") is False
+
+
+@pytest.mark.parametrize(
+    "inner",
+    [
+        "cargo test",       # build allowlist, not SAFE_SHELL_COMMANDS
+        "git status",       # git allowlist
+        "gh pr list",       # gh allowlist
+        "npm run build",    # build allowlist
+    ],
+)
+def test_command_builtin_narrower_than_full_tier1(inner: str) -> None:
+    """Intentional narrowing (KTD-2): the recursion re-enters is_safe_shell_command
+    (the shell allowlist + find/xargs/command sub-guards) — NOT the full
+    _is_safe_sub_command dispatch. So a tier1-safe inner from the build/git/gh/mika
+    allowlist DENIES when wrapped in `command`, even though its bare form
+    auto-approves. This is an over-block (an extra relay round-trip, never a hole),
+    mirroring the read-only posture of `find`/`xargs`. Pinned so the boundary is
+    a decision, not an accident; the live dev-pilot idiom is `command -v <tool>`
+    (test_command_builtin_allowed), which is unaffected."""
+    # Bare form auto-approves...
+    assert is_safe_bash_command(inner) is True, f"bare: {inner}"
+    # ...but the `command`-wrapped form does not (deliberate narrowing).
+    assert is_safe_bash_command(f"command {inner}") is False, f"wrapped: command {inner}"
 
 
 # ── cpp#27: awk + sed dropped from SAFE_SHELL_COMMANDS ───────────────────────
