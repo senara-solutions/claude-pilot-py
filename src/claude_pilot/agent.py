@@ -66,6 +66,19 @@ async def run_agent(
         can_use_tool=permission_handler,
         include_partial_messages=True,
         system_prompt=_system_prompt_with_hint(),
+        # cpp#59 — defense-in-depth tool-surface exclusion. `ScheduleWakeup` is a
+        # Claude Code harness/CLI runtime primitive (the `/loop` pacing tool),
+        # NOT a permissionable SDK tool: the runtime handles it internally and
+        # bypasses can_use_tool entirely, so a tier1/policy deny is structurally
+        # inert (see DENIED_BASH_PATTERNS_HINT scope note). In headless SDK mode
+        # it is a no-op that strands the session (mika#1652). `disallowed_tools`
+        # maps to the CLI `--disallowedTools` flag; transcript evidence shows
+        # ScheduleWakeup IS a real surfaced/executed tool, so a bare-name deny
+        # SHOULD remove it from the request — but the SDK docs do not definitively
+        # confirm --disallowedTools filters runtime primitives, so this is
+        # best-effort. The LOAD-BEARING guard is the system-prompt hint above;
+        # this is harmless if it no-ops and structural if the runtime honors it.
+        disallowed_tools=["ScheduleWakeup"],
         **_sdk_guardrail_kwargs(config),
     )
 

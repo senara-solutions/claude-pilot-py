@@ -178,6 +178,18 @@ def is_tier3_dangerous(command: str) -> bool:
 # NOT close the session-fatality class. Novel denied patterns still crash the
 # session — that class closes only when cpp#20 joint 2's contract is revised to
 # distinguish adaptation from fabrication (mika#1410).
+#
+# Scope note (cpp#59): this constant grew beyond denied-Bash patterns. It is the
+# single model-facing prevention-hint payload appended to the system prompt, and
+# now also carries a "no-ops in headless mode" section for harness/runtime tools
+# (ScheduleWakeup) that claude-pilot's permission layer CANNOT intercept — the
+# SDK/CLI runtime handles them internally, bypassing can_use_tool entirely, so a
+# tier1/policy deny is structurally inert. The system-prompt hint is the only
+# channel that reaches the model for that class. The name is kept (referenced by
+# CLAUDE.md + tests) despite the broadened scope. Same honest-closure boundary:
+# prompt-only reduces the RATE of the stochastic ScheduleWakeup trap (n=1 of 139
+# sessions, mika#1652), it does not close the class; the disallowed_tools guard in
+# agent.py is best-effort defense-in-depth on top.
 DENIED_BASH_PATTERNS_HINT: str = """\
 ## Bash commands that crash this session — use the native tool instead
 
@@ -211,7 +223,21 @@ them — use the auto-approved native tool, which accomplishes the same goal:
   (Grep/Glob/Read/Edit/Write) for the underlying goal.
 
 Prefer Read, Write, Edit, Grep, and Glob over their shell equivalents: they are
-auto-approved and never halt the session."""
+auto-approved and never halt the session.
+
+## Tools that are no-ops in headless mode — never call them
+
+You are running headlessly via the Claude Agent SDK. There is NO interactive
+harness watching for wake events, so the tools below silently do nothing and
+strand your session:
+
+- `ScheduleWakeup` → schedules a future wake the INTERACTIVE harness would fire.
+  In headless mode nothing fires it: the call returns "wakeup scheduled", your
+  turn ends, and your prompted continuation NEVER runs — the session just ends
+  with the work unfinished. Never call it. If you dispatched an `Agent`/subagent
+  (e.g. Explore) and want to "wait" for its result, you do NOT need to: the
+  subagent runs synchronously and its result is already available to you in the
+  next turn. Just continue your work in-turn — read the result and proceed."""
 
 
 # ── Safe Bash command checking ───────────────────────────────────────────────

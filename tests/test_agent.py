@@ -476,6 +476,59 @@ async def test_1409_run_agent_passes_system_prompt_into_options(
     assert "-exec" in sp["append"] and "Grep" in sp["append"]
 
 
+# ── cpp#59: ScheduleWakeup headless no-op prevention ──────────────────────────
+
+
+def test_59_system_prompt_hint_warns_against_schedulewakeup() -> None:
+    """The appended system-prompt hint must name ScheduleWakeup, explain the
+    headless no-op failure mode, and tell the model not to "wait" for a
+    synchronous subagent result. This is the LOAD-BEARING guard (the SDK runtime
+    handles ScheduleWakeup internally, bypassing the permission layer — a
+    tier1/policy deny cannot catch it)."""
+    from claude_pilot.tier1 import DENIED_BASH_PATTERNS_HINT
+
+    sp = agent_module._system_prompt_with_hint()
+    append = sp["append"]
+    # Regression guard — the preset-append wiring still carries the constant verbatim.
+    assert append == DENIED_BASH_PATTERNS_HINT
+    # The headless no-op section is present and names the tool.
+    assert "ScheduleWakeup" in append
+    assert "no-ops in headless mode" in append
+    # The "don't wait for a synchronous subagent" guidance is present.
+    assert "synchronous" in append
+    assert "Agent" in append
+
+
+@pytest.mark.asyncio
+async def test_59_run_agent_disallows_schedulewakeup_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defense-in-depth: run_agent constructs ClaudeAgentOptions with
+    ScheduleWakeup in disallowed_tools, so where the runtime honors
+    --disallowedTools the model never sees the tool."""
+    captured: dict[str, Any] = {}
+
+    def _capturing_options(*_args: Any, **kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return object()  # FakeClient ignores options
+
+    monkeypatch.setattr(agent_module, "ClaudeAgentOptions", _capturing_options)
+    _install_fake_client(monkeypatch, [_init(), _result()])
+
+    await run_agent(
+        prompt="test",
+        cwd=".",
+        verbose=False,
+        task_id=None,
+        permission_handler=_noop_permission,
+        guardrails=SessionGuardrails(_config()),
+    )
+
+    disallowed = captured.get("disallowed_tools")
+    assert isinstance(disallowed, list)
+    assert "ScheduleWakeup" in disallowed
+
+
 # ── cpp#55: _extract_session_id / _extract_model read SystemMessage.data ──────
 
 
