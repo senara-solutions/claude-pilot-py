@@ -199,6 +199,10 @@ async def run_agent(
                         duration_ms=message.duration_ms,
                         errors=errors,
                         termination_reason=termination_reason,
+                        # cpp#54: deterministic 429/500/529 signal for
+                        # downstream classification. getattr-guarded so an SDK
+                        # minor lacking the field degrades to None, not a crash.
+                        api_error_status=getattr(message, "api_error_status", None),
                     )
                     _emit_result(result)
                     emitted_terminal = True  # cpp#20 joint 2 mutual-exclusion guard (Site 2)
@@ -364,11 +368,26 @@ def _text_of(block: Any) -> str | None:
 
 
 def _extract_session_id(message: SystemMessage) -> str | None:
+    # SDK 0.2.x nests session_id under SystemMessage.data (cpp#55). Read the
+    # nested location first, then fall back to a top-level attr so mocks and a
+    # future SDK that reverts the nesting both keep working.
+    data = getattr(message, "data", None)
+    if isinstance(data, dict):
+        sid = data.get("session_id")
+        if isinstance(sid, str):
+            return sid
     sid = getattr(message, "session_id", None)
     return sid if isinstance(sid, str) else None
 
 
 def _extract_model(message: SystemMessage) -> str | None:
+    # SDK 0.2.x nests model under SystemMessage.data (cpp#55); see
+    # _extract_session_id for the guarded-access rationale.
+    data = getattr(message, "data", None)
+    if isinstance(data, dict):
+        model = data.get("model")
+        if isinstance(model, str):
+            return model
     model = getattr(message, "model", None)
     return model if isinstance(model, str) else None
 

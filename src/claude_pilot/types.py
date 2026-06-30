@@ -72,6 +72,12 @@ class PilotEvent(BaseModel):
     agent_id: str | None = None
     decision_reason: str | None = None
     blocked_path: str | None = None
+    # cpp#56: additive ToolPermissionContext enrichment (SDK 0.2.x; these fields
+    # landed upstream in v0.1.74). Optional so older relay payloads and SDK
+    # minors lacking these fields stay valid; serialized absent via exclude_none.
+    title: str | None = None
+    display_name: str | None = None
+    description: str | None = None
     error: str | None = None
 
 
@@ -127,6 +133,12 @@ class ResultJson(BaseModel):
     duration_ms: int
     errors: list[str] | None = None
     termination_reason: str | None = None
+    # cpp#54: HTTP status of a Claude-API error (429/500/529) surfaced by SDK
+    # 0.2.x `ResultMessage.api_error_status`, letting downstream (mika-dev
+    # dispatch-lib) classify a transient overload deterministically vs. a
+    # genuine failure. None when the session ended without an API error or the
+    # SDK did not populate it; serialized absent via exclude_none.
+    api_error_status: int | None = None
 
     def to_line(self) -> str:
         """Serialize to a single JSON line (no trailing newline)."""

@@ -1,11 +1,12 @@
 ---
 title: "A claude-agent-sdk major-version jump is a mechanical bump, not a rewrite — verify against a watch list"
 date: 2026-06-30
+last_updated: 2026-06-30
 module: claude_pilot
 component: dependencies
 problem_type: tooling_decision
 category: tooling-decisions
-tags: [claude-agent-sdk, dependency-upgrade, staged-upgrade, watch-list, mika-1409, cpp-52, semver]
+tags: [claude-agent-sdk, dependency-upgrade, staged-upgrade, watch-list, mika-1409, cpp-52, cpp-54, cpp-55, cpp-56, semver]
 applies_when: "bumping claude-agent-sdk across many minors or a 0.x major boundary in claude-pilot"
 ---
 
@@ -64,13 +65,46 @@ exercises boot → `can_use_tool` → `ResultJson` without touching the live mik
   the relay. Use a tool set to "ask" (Write outside cwd → deny/interrupt; Write inside cwd → tier1
   AUTO) to drive the callback. The external-relay round-trip itself is covered by unit tests.
 
-## Latent finding (pre-existing, surfaced by the smoke)
+## Latent finding (pre-existing, surfaced by the smoke) — RESOLVED cpp#55
 
 `agent.py:_extract_session_id`/`_extract_model` read top-level `message.session_id`/`.model`, but
 `SystemMessage` is `{subtype, data}` — the id/model live in `.data`. The `[init]` log prints empty
 session_id/model. It's **cosmetic and pre-existing** (the unit fixtures already nest session_id in
 `.data`): reconnect detection is `seen_init`-keyed and `ResultJson.session_id` is captured correctly
 from later messages. Worth a Stage-2 fix (read `.data`), not a Stage-1 blocker.
+
+**Fixed in cpp#55** (PR for branch `fix/agent-composite-55-54-56-sdk-stage2`): both helpers now
+read `message.data.get("session_id")`/`.get("model")` first, falling back to the top-level `getattr`
+so a mock or a future SDK that un-nests still resolves. The prediction held exactly — a `.data` read,
+no other change.
+
+## Stage 2 adoption pattern — predicted small/additive work lands small/additive (cpp#54, cpp#56)
+
+The same PR adopted the two net-new SDK surfaces the friction analysis deferred out of the mechanical
+bump. Both confirm the general shape: **a mechanical SDK bump's predicted Stage-2 work is small,
+additive, and `getattr`-guarded — never a refactor.**
+
+- **cpp#54** — `ResultMessage.api_error_status` (SDK 0.2.x, `int | None`) surfaced into `ResultJson`.
+  One new `Optional` field defaulting `None`, read via `getattr(message, "api_error_status", None)`,
+  plumbed at the single `ResultMessage` construction site. Gives mika-dev dispatch-lib a deterministic
+  429/500/529 signal vs. parsing prose `errors`.
+- **cpp#56** — `ToolPermissionContext` enrichment (`decision_reason`, `blocked_path`, `title`,
+  `display_name`, `description`) captured onto `PilotEvent`. Three new `Optional` fields, populated via
+  `getattr(ctx, ..., None)` at the lone relay construction site.
+
+Two reusable rules for adopting moved or net-new SDK surface on a wire-format schema:
+
+1. **Moved field → nested-first + top-level fallback** (cpp#55). When a field relocates (here into a
+   `.data` dict), read the new location first and fall back to the old `getattr`. The dual path costs
+   two lines and survives both directions of a future shape change.
+2. **Net-new field → `Optional` default `None` + `exclude_none`** (cpp#54/#56). `ResultJson` and
+   `PilotEvent` serialize with `model_dump_json(exclude_none=True)`, so an additive nullable field is
+   absent on the wire when unset — downstream parsers (dispatch-lib, mika-dev relay) never break on a
+   missing key. Use the SDK's verbatim field names so the next bump has zero rename drift.
+
+Both adoptions were independently confirmed against the installed 0.2.110 (`api_error_status` typed
+`int | None`; all five `ToolPermissionContext` fields present) before relying on them — the same
+"verify against the installed SDK, don't trust the changelog" discipline as the bump itself.
 
 ## Why This Matters
 
@@ -83,4 +117,5 @@ from later messages. Worth a Stage-2 fix (read `.data`), not a Stage-1 blocker.
 
 ## Related
 - `sdk-system-prompt-must-be-preset-append-not-plain-string.md` — the load-bearing preset mapping
-- cpp#52 — this upgrade · mika#1409 — the SystemPromptPreset founding incident
+- cpp#52 — this upgrade (Stage 1, mechanical bump) · mika#1409 — the SystemPromptPreset founding incident
+- cpp#55 — the predicted `.data` extraction fix · cpp#54 / cpp#56 — the Stage-2 additive adoptions (one PR)
