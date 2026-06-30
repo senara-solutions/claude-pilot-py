@@ -467,8 +467,24 @@ _FIRST_WORD_RE = re.compile(r"^\s*(\S+)")
 # allowlist (docs/solutions/security-issues/command-string-policy-allow-rules-are-compound-unsafe.md §4):
 # over-blocking is the correct failure mode; widening the set is an
 # evidence-gated follow-up, not a code change made on a hunch.
+#
+# An entry belongs here ONLY if the binary cannot execute another command or
+# write a file through its OWN flags (we don't parse those flags). `rg`
+# (ripgrep) was REMOVED before merge: `rg --pre <CMD>` / `--hostname-bin` /
+# `--search-zip` execute external commands, so `find -exec rg --pre evil` is a
+# proven-live RCE (cpp#33 security review). The native Grep tool (ripgrep-backed)
+# covers the search use case without the exec surface.
+#
+# LOAD-BEARING PRECONDITION (cpp#44): `grep`/`egrep`/`fgrep` are read-only ONLY
+# under GNU grep. `ugrep` (a drop-in `grep` on some Gentoo/BSD/Homebrew hosts)
+# adds `--filter=CMD` / `--pager` / `--view`, which execute commands — the same
+# class as `rg --pre`. The pilot runs in standard-Linux containers where
+# `find -exec` resolves to GNU `/bin/grep`, so this is safe in the deployment
+# target; cpp#44 tracks verifying the container grep provider and reconsidering
+# these entries if a ugrep host is ever in scope. Do not add a new grep-family
+# entry without re-checking that precondition.
 FIND_EXEC_SAFE_COMMANDS: frozenset[str] = frozenset({
-    "grep", "egrep", "fgrep", "rg",
+    "grep", "egrep", "fgrep",
     "cat", "head", "tail", "wc",
     "ls", "stat", "file",
     "basename", "dirname", "readlink", "realpath",
@@ -477,6 +493,15 @@ FIND_EXEC_SAFE_COMMANDS: frozenset[str] = frozenset({
 
 # `-delete` is a built-in find action that removes matched files — always deny.
 _FIND_DELETE_RE = re.compile(r"-delete\b")
+# find's file-WRITING actions: `-fprintf FILE FORMAT` writes attacker-controlled
+# content to an arbitrary FILE; `-fprint`/`-fprint0`/`-fls` write filenames /
+# listings to FILE. None are exec or `-delete`, so they bypass the other guards
+# and would otherwise fall through to the pure-search allow path — an arbitrary
+# file-write primitive (cpp#33 security review, proven vs real bash). Deny them.
+# `\b` keeps `-fprint` from being a false prefix of `-fprintf`/`-fprint0`; the
+# stdout forms (`-printf`/`-print`/`-print0`/`-ls`) are not matched and stay
+# allowed.
+_FIND_WRITE_RE = re.compile(r"-(?:fprintf|fprint0|fprint|fls)\b")
 # `-exec`/`-execdir`/`-ok`/`-okdir` all run an external command; capture the
 # first token after each (the executed binary). Longest alternative first so
 # `-execdir`/`-okdir` aren't mis-split as `-exec`/`-ok`. `-ok`/`-okdir` are
@@ -488,9 +513,12 @@ _FIND_EXEC_INNER_RE = re.compile(r"-(?:execdir|exec|okdir|ok)\b\s+(\S+)")
 def _is_safe_find_command(sub: str) -> bool:
     """Decide whether a `find` invocation is safe to auto-approve (cpp#33).
 
-    Safe iff it neither deletes nor execs a non-read-only command:
+    Safe iff it neither deletes, writes to a file, nor execs a non-read-only
+    command:
 
     - `-delete` modifies the filesystem → deny.
+    - `-fprintf`/`-fprint`/`-fprint0`/`-fls` write to an arbitrary FILE → deny
+      (a write primitive that is neither exec nor `-delete`).
     - `-exec`/`-execdir`/`-ok`/`-okdir` run an external command → allow only
       when EVERY such inner command is in FIND_EXEC_SAFE_COMMANDS (exact-literal
       match; no inner-argument parsing).
@@ -507,7 +535,7 @@ def _is_safe_find_command(sub: str) -> bool:
     `sh -c`/`bash -c` inside `-exec` are denied here (not in the allowlist) and
     independently by the TIER3 `sh -c`/`bash -c` patterns (defense in depth).
     """
-    if _FIND_DELETE_RE.search(sub):
+    if _FIND_DELETE_RE.search(sub) or _FIND_WRITE_RE.search(sub):
         return False
 
     inner_commands = _FIND_EXEC_INNER_RE.findall(sub)

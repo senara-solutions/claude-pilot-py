@@ -291,6 +291,43 @@ def test_find_exec_substitution_denied(command: str) -> None:
     assert is_safe_bash_command(command) is False, command
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        # find's file-WRITE actions (cpp#33 security review, P0 — proven vs
+        # real bash): arbitrary file write, neither exec nor -delete.
+        'find . -maxdepth 0 -fprintf /tmp/x "ssh-rsa PWNED\\n"',
+        "find . -fprint /tmp/list.txt",
+        "find . -fprint0 /tmp/list0.txt",
+        "find . -fls /tmp/ls.txt",
+        # rg removed from FIND_EXEC_SAFE_COMMANDS (cpp#33 security review, P0 —
+        # `rg --pre <cmd>` runs arbitrary commands; proven-live RCE). rg is now
+        # denied as an inner command at all (not just its --pre form).
+        "find . -name t.txt -exec rg --pre ./pwn.sh needle {} \\;",
+        "find . -exec rg PATTERN {} +",
+    ],
+)
+def test_find_write_and_rg_denied(command: str) -> None:
+    assert is_safe_bash_command(command) is False, command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # stdout forms (NOT the -f* file-write actions) write only to stdout —
+        # they must stay allowed (regression guard: the write-action deny must
+        # not over-block these).
+        'find . -printf "%p\\n"',
+        "find . -print",
+        "find . -print0",
+        "find . -ls",
+        "find . -name '*.py' -print",
+    ],
+)
+def test_find_stdout_actions_still_allowed(command: str) -> None:
+    assert is_safe_bash_command(command) is True, command
+
+
 def test_find_exec_deny_moved_off_tier3() -> None:
     """cpp#33 layer-move: find -delete / find -exec rm are no longer TIER3
     matches, but remain denied overall at the allow-list layer."""
