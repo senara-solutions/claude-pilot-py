@@ -91,9 +91,6 @@ CanUseTool = Callable[
 # the single sanctioned ``cat > /tmp`` rule, and only when nothing executable is
 # chained after the heredoc terminator. Every other ``<<`` command is vetoed.
 
-# Command-substitution markers forbidden on the policy-allow path.
-_SUBSTITUTION_MARKERS = ("$(", "`", "$'")
-
 # Closed-world allowlist of whole command-substitution tokens that are known
 # safe to embed in a policy-allowed command (cpp#34, mika-arch session
 # 783d4a04). Each entry is matched by EXACT LITERAL STRING EQUALITY of the entire

@@ -17,6 +17,7 @@ from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 from claude_agent_sdk.types import ToolPermissionContext
 
 from claude_pilot.permissions import (
+    _SUBSTITUTION_ALLOWLIST,
     _bash_allow_is_chain_safe,
     create_permission_handler,
 )
@@ -110,15 +111,9 @@ def test_guard_no_false_positive_on_var_expansion() -> None:
 # --- cpp#34: closed-world substitution-inner allowlist (mika-arch 783d4a04) ---
 # The blanket ``$(`` veto admits a narrow closed world of whole-token literals:
 # read-only git plumbing substitutions feeding a read-only outer command. Match
-# is exact-literal; anything off the list still vetoes. See
-# ``_SUBSTITUTION_ALLOWLIST`` in ``permissions.py``.
-
-_SUBSTITUTION_ALLOWLIST = (
-    "$(git branch --show-current)",
-    "$(git rev-parse --abbrev-ref HEAD)",
-    "$(git rev-parse HEAD)",
-    "$(git rev-parse --short HEAD)",
-)
+# is exact-literal; anything off the list still vetoes. Tests import the
+# production ``_SUBSTITUTION_ALLOWLIST`` so they exercise the real list, not a
+# drifting copy.
 
 
 def test_guard_allows_gh_pr_read_with_branch_substitution() -> None:
