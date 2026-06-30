@@ -46,10 +46,12 @@ options = ClaudeAgentOptions(
 )
 ```
 
-Verified mapping (SDK 0.1.59 `subprocess_cli.py`): `None` → `--system-prompt ""`,
+Verified mapping (re-confirmed unchanged at SDK 0.2.110 `_internal/transport/subprocess_cli.py`
+lines 227-238; originally verified at 0.1.59): `None` → `--system-prompt ""`,
 `str` → `--system-prompt <str>` (**replace**), preset+append → `--append-system-prompt
-<hint>` (**preserve**). Annotate the helper's return type as `SystemPromptPreset`
-so mypy rejects a future regression to a bare string.
+<hint>` (**preserve**). 0.2.110 adds a new `{"type": "file", "path": ...}` →
+`--system-prompt-file` branch — additive, unused by claude-pilot. Annotate the helper's
+return type as `SystemPromptPreset` so mypy rejects a future regression to a bare string.
 
 ### 2. "Co-location prevents drift" is false unless a test backs it
 
