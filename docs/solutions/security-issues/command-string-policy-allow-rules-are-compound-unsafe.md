@@ -503,22 +503,51 @@ Design points worth keeping:
    metacharacter scan). So the validator runs once, in the handler, right after
    `_bash_allow_is_chain_safe`, where every write-capable allow is honored and
    nowhere else. A future write-capable rule inherits the check for free.
-2. **Order is load-bearing: containment FIRST, control-plane SECOND.** Containment
+2. **Classify write-capability STRUCTURALLY (leading command word), NEVER by the
+   matched `rule_id`.** This is the subtle one — the first cut keyed on
+   `evaluate(seg).rule_id ∈ {cp-mv, mkdir, …}`, and a cross-model adversarial pass
+   broke it: `policy.evaluate` is first-match-wins `re.search`, and a benign
+   earlier rule **shadows** the write rule while bash still performs the write.
+   `bash-grep`'s `\sgrep\s` matches ` grep ` *anywhere*, so
+   `cp "payload grep x" .git/hooks/post-checkout` evaluates to `rule_id=bash-grep`
+   → a rule-id gate skips the segment → the control-plane write is allowed (no
+   symlink, no pre-plant). The matched rule is **not** what bash executes; the
+   literal leading command word is. The whole command is already established
+   allow + chain-safe by the handler, so classification only has to answer "what
+   does bash write here," and that is a property of the command shape, not the
+   policy's first-match. (`git show … >` is immune — its `>` forces chain-safety
+   to demand the `bash-git-show-redirect` rule_id specifically and any shadow
+   makes the `>` tier3-dangerous — but the no-redirect writers cp/mv/mkdir were
+   wide open.) Generalizes §1's "denylist is incomplete by nature": a *first-match
+   allowlist* is just as unsound a basis for a security *classification*.
+3. **Tokenize operands with `shlex`, not `str.split`.** The same ` grep ` shadow
+   trick puts spaces in an operand, and a naive split fragments a quoted path
+   (`cp src "esc/a grep b"` → `"esc/a`, `b"`) so the symlink/control-plane
+   component is never resolved. POSIX `shlex.split` recovers the operand bash
+   actually sees; a tokenization error (unbalanced quotes) fails closed.
+4. **Order is load-bearing: containment FIRST, control-plane SECOND.** Containment
    is the safety boundary; the denylist is layered policy on an *already-contained*
    path. A symlink that escapes the worktree AND looks control-plane must be
    reported as a containment failure, not mislabeled.
-3. **The validator needs `cwd`; the YAML rule cannot resolve the filesystem.**
+5. **The validator needs `cwd`; the YAML rule cannot resolve the filesystem.**
    This is why the guarantee lives in code at the honoring point, not in the
    pattern. The rule stays a shape filter; the comment points at the code.
-4. **Match the canonical worktree-relative path, not the raw string.** Resolve,
+6. **Match the canonical worktree-relative path, not the raw string.** Resolve,
    then `relative_to(worktree_root)`, then literal-prefix match — so a symlink
-   resolving *into* `.git/` is still denied, and top-level `.gitignore` is *not*
-   (anchor `^\.git/` with the trailing slash).
-5. **Fail closed on unparseable destinations**, and keep the control-plane
+   resolving *into* `.git/` is still denied. Anchor each entry with `(/|$)`, not a
+   bare trailing `/`: a trailing-slash-only `^\.git/` misses the **bare** target
+   (`cp source .git`, `cp -t .claude x`, `git show … > .git`) — which overwrites
+   the gitdir pointer or writes *into* the control-plane dir — while `(/|$)` still
+   lets top-level `.gitignore` through (the char after `.git` is `i`, not `/`/end).
+   The `cp -t DIR` / bare-destination form is the evasion this closes.
+7. **Fail closed on unparseable destinations**, and keep the control-plane
    denylist a small symbolic constant with per-entry rationale — broaden only
    with evidence. The accepted residual is `Path.resolve` TOCTOU (a symlink
    swapped between check and exec), identical to what the Write tool's
-   `is_within_project` already accepts; documented, not closed.
+   `is_within_project` already accepts; documented, not closed. Known residual
+   denylist gaps to evidence-gate next: `.github/actions/` (composite/JS actions
+   run in CI with the same org-token blast radius as workflows), `.github/CODEOWNERS`,
+   `.github/dependabot.yml`.
 
 ## When to Apply
 

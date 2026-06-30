@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import sys
 import time
 from collections.abc import Awaitable, Callable
@@ -321,31 +322,77 @@ def _bash_allow_is_chain_safe(
 # metacharacter/danger scan — so all three can only be approved through the
 # Tier-2 policy path. One chokepoint, no per-rule duplication.
 
-# Rules whose policy `allow` writes to a destination operand that must be
-# contained + control-plane-checked. Keep in sync with the YAML rule ids.
-_WRITE_CAPABLE_RULE_IDS: frozenset[str] = frozenset({
-    "bash-git-show-redirect",
-    "bash-cp-mv",
-    "bash-mkdir",
-})
+# Write-capability is classified STRUCTURALLY, by the segment's leading command
+# word — NEVER by the policy `rule_id`. `policy.evaluate` is first-match-wins
+# `re.search`, so a benign earlier rule shadows the write rule while bash still
+# executes the write: `bash-grep`'s `\sgrep\s` matches ` grep ` ANYWHERE, so
+# `cp "payload grep x" .git/hooks/post-checkout` evaluates to `rule_id=bash-grep`
+# — a rule-id gate would skip it and miss the control-plane write. The whole
+# command was already established as allow + chain-safe by the handler; the
+# literal command shape, not the matched rule, is the source of truth for what
+# bash writes (cpp#42 adversarial review).
+_LEADING_CMD_RE = re.compile(r"^\s*(\S+)")
+_GIT_SHOW_RE = re.compile(r"^\s*git\s+show\b")
 
 # `git show <SHA>:<src> > <dest>` — the redirect target is the write destination.
-# Mirrors the anchored `bash-git-show-redirect` YAML pattern's target group.
+# Mirrors the anchored `bash-git-show-redirect` YAML pattern's target group; its
+# `[\w./-]+` class excludes spaces/quotes, so a quoted/spaced redirect target
+# can't match the rule at all (it would be denied) — regex-on-raw-segment is safe
+# here, unlike cp/mv/mkdir whose operands are shell-quoted (tokenized via shlex).
 _GIT_SHOW_REDIRECT_DEST_RE = re.compile(r">\s*([\w./-]+)\s*$")
+
+# A `cp`/`mv` short-flag cluster whose last (arg-taking) flag is `-t`
+# (target-directory): `-t`, `-rt`, `-vt`, `-rpt`, … The NEXT token is the target
+# directory. The attached form (`-tDIR`) is NOT matched here — it has no separate
+# next token, so it falls through to the fail-closed `None` (safe over-deny).
+_CP_MV_TARGET_FLAG_RE = re.compile(r"-[A-Za-z]*t")
 
 # Control-plane denylist (cpp#42): in-worktree destinations that, if written,
 # compromise the surface that constrains the agent. Matched against the canonical
 # worktree-RELATIVE resolved path (so a symlink that lands inside `.git/` etc. is
-# still caught). Anchored so a sibling like top-level `.gitignore` does NOT match.
+# still caught). Each entry is anchored with `(/|$)` so it matches BOTH the bare
+# directory/file (`cp source .git`, `cp -t .claude x` — which write the gitdir
+# pointer / into the dir) AND any path beneath it, while a sibling like top-level
+# `.gitignore` still does NOT match (the char after `.git` is `i`, not `/`/end).
 # Each entry carries its blast-radius rationale; broadening is evidence-gated.
 _CONTROL_PLANE_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"^\.git/"),                       # hooks/config — execute on next checkout
-    re.compile(r"^\.github/workflows/"),          # run in CI with broad org-token access
-    re.compile(r"^\.claude/"),                    # agent's own slash commands (self-modify)
-    re.compile(r"^skills/bundled/"),              # bundled skills every pilot session trusts
+    re.compile(r"^\.git(/|$)"),                   # hooks/config/gitdir — execute on next checkout
+    re.compile(r"^\.github/workflows(/|$)"),      # run in CI with broad org-token access
+    re.compile(r"^\.claude(/|$)"),                # agent's own slash commands (self-modify)
+    re.compile(r"^skills/bundled(/|$)"),          # bundled skills every pilot session trusts
     re.compile(r"^crates/mika-agent/src/well_known_agents\.rs$"),  # mika agent identities
-    re.compile(r"^\.mika/"),                       # ~/.mika runtime config
+    re.compile(r"^\.mika(/|$)"),                  # ~/.mika runtime config
 )
+
+
+def _segment_write_kind(seg: str) -> str | None:
+    """Classify a command segment by the file-write it performs, from its leading
+    command word only (rule-order-independent). Returns the write-kind key, or
+    ``None`` for a non-write segment."""
+    m = _LEADING_CMD_RE.match(seg)
+    if not m:
+        return None
+    cmd = m.group(1)
+    if cmd in ("cp", "mv"):
+        return "bash-cp-mv"
+    if cmd == "mkdir":
+        return "bash-mkdir"
+    if cmd == "git" and _GIT_SHOW_RE.match(seg) and ">" in seg:
+        return "bash-git-show-redirect"
+    return None
+
+
+def _shlex_operands(seg: str) -> list[str] | None:
+    """POSIX shell word-split of a segment (quotes removed the way bash would),
+    or ``None`` on a tokenization error (unbalanced quotes) so the caller fails
+    closed. Using shlex — not ``str.split`` — is load-bearing: a quoted operand
+    with spaces (`cp src "esc/a grep b"`) must yield the real path `esc/a grep b`,
+    not the fragments `"esc/a` / `b"`, or the symlink/control-plane component is
+    never seen."""
+    try:
+        return shlex.split(seg)
+    except ValueError:
+        return None
 
 
 def _extract_cp_mv_destination(seg: str) -> list[str] | None:
@@ -356,12 +403,18 @@ def _extract_cp_mv_destination(seg: str) -> list[str] | None:
     `-t`/`--target-directory` value when present, else the last positional
     operand. Returns ``None`` (fail-closed) when no destination is parseable.
     """
-    tokens = seg.split()
-    if len(tokens) < 3:  # need command + >= 1 source + destination
+    tokens = _shlex_operands(seg)
+    if tokens is None or len(tokens) < 3:  # need command + >= 1 source + dest
         return None
     rest = tokens[1:]
     for i, tok in enumerate(rest):
-        if tok in ("-t", "--target-directory") and i + 1 < len(rest):
+        # `-t DIR` and the GNU combined short-flag forms (`-rt DIR`, `-vt DIR`,
+        # …) put the TARGET DIRECTORY in the next token and make every positional
+        # a source — so the real write destination is `<DIR>/<src>`, NOT the last
+        # positional. Missing this validates a benign source operand while bytes
+        # land in an unchecked (possibly escaping or control-plane) directory.
+        # A short cluster ending in `t` means `-t` is its last, arg-taking flag.
+        if (tok == "--target-directory" or _CP_MV_TARGET_FLAG_RE.fullmatch(tok)) and i + 1 < len(rest):
             return [rest[i + 1]]
         if tok.startswith("--target-directory="):
             return [tok.split("=", 1)[1]]
@@ -378,22 +431,23 @@ def _extract_mkdir_destinations(seg: str) -> list[str] | None:
     which is harmless: it resolves in-worktree and is not control-plane, so it
     never produces a false deny while the real target(s) are still validated.
     """
-    tokens = seg.split()
-    if len(tokens) < 2:
+    tokens = _shlex_operands(seg)
+    if tokens is None or len(tokens) < 2:
         return None
     dests = [t for t in tokens[1:] if not t.startswith("-")]
     return dests or None
 
 
-def _extract_write_destinations(rule_id: str, seg: str) -> list[str] | None:
-    """Destination operand(s) for a write-capable rule segment, or ``None`` to
-    fail closed when the destination cannot be parsed."""
-    if rule_id == "bash-git-show-redirect":
+def _extract_write_destinations(kind: str, seg: str) -> list[str] | None:
+    """Destination operand(s) for a write-capable segment, or ``None`` to fail
+    closed when the destination cannot be parsed. ``kind`` is the structural
+    write-kind from ``_segment_write_kind``, never a policy rule_id."""
+    if kind == "bash-git-show-redirect":
         m = _GIT_SHOW_REDIRECT_DEST_RE.search(seg)
         return [m.group(1)] if m else None
-    if rule_id == "bash-cp-mv":
+    if kind == "bash-cp-mv":
         return _extract_cp_mv_destination(seg)
-    if rule_id == "bash-mkdir":
+    if kind == "bash-mkdir":
         return _extract_mkdir_destinations(seg)
     return None
 
@@ -419,27 +473,28 @@ def _is_control_plane_path(dest: str, cwd: str) -> bool:
     return any(pat.match(rel) for pat in _CONTROL_PLANE_PATTERNS)
 
 
-def _destination_veto_reason(
-    policy: Policy, command: str, cwd: str
-) -> str | None:
+def _destination_veto_reason(command: str, cwd: str) -> str | None:
     """Veto reason if any write-capable segment's destination escapes the
     worktree (cpp#38) or lands on the agent control plane (cpp#42); else ``None``.
 
     Per-segment so a compound like ``mkdir a && cp s esc/x`` validates each write
-    target independently. Order is load-bearing: CONTAINMENT first (the safety
-    boundary), CONTROL-PLANE second (layered policy on an already-contained path).
-    Unparseable destinations fail closed (vetoed).
+    target independently. Each segment is classified STRUCTURALLY by its leading
+    command word (``_segment_write_kind``) — never by a shadowable policy rule_id.
+    Order is load-bearing: CONTAINMENT first (the safety boundary), CONTROL-PLANE
+    second (layered policy on an already-contained path). Unparseable destinations
+    fail closed (vetoed). The caller has already established the whole command as
+    allow + chain-safe, so this only decides where the write lands.
     """
     if not isinstance(command, str) or not command:
         return None
     for seg in _split_compound_command(command):
-        pd = evaluate(policy, "Bash", {"command": seg})
-        if pd.decision != "allow" or pd.rule_id not in _WRITE_CAPABLE_RULE_IDS:
+        kind = _segment_write_kind(seg)
+        if kind is None:
             continue
-        dests = _extract_write_destinations(pd.rule_id, seg)
+        dests = _extract_write_destinations(kind, seg)
         if not dests:
             return (
-                f"write-capable rule {pd.rule_id} destination could not be "
+                f"write-capable segment ({kind}) destination could not be "
                 "parsed — denied fail-closed"
             )
         for dest in dests:
@@ -531,7 +586,7 @@ def create_permission_handler(
                 # every other policy denial (cpp#20 joint 2).
                 if tool_name == "Bash":
                     dest_veto = _destination_veto_reason(
-                        policy, tool_input.get("command", ""), cwd
+                        tool_input.get("command", ""), cwd
                     )
                     if dest_veto is not None:
                         log_policy_deny(tool_name, detail, pd.rule_id)
