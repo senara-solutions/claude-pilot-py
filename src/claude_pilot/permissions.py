@@ -90,6 +90,12 @@ CanUseTool = Callable[
 # ``<<<`` (here-string) is vetoed outright; ``<<`` (heredoc) is admitted only for
 # the single sanctioned ``cat > /tmp`` rule, and only when nothing executable is
 # chained after the heredoc terminator. Every other ``<<`` command is vetoed.
+#
+# Redirect (``>``): the wholesale tier3 ban on ``>`` is lifted for exactly ONE
+# more sanctioned shape besides the /tmp heredoc — ``git show <SHA>:<path> >
+# <relative-path>`` (cpp#35), recognized by honoring the ``bash-git-show-redirect``
+# policy rule_id after the universal vetoes above have run. See the inline
+# comment at that branch for the safety argument.
 
 # Closed-world allowlist of whole command-substitution tokens that are known
 # safe to embed in a policy-allowed command (cpp#34, mika-arch session
@@ -220,6 +226,23 @@ def _bash_allow_is_chain_safe(
         command = redacted
     if _BARE_AMP_RE.search(command):
         return False
+
+    # Sanctioned `git show <SHA>:<path> > <relative-path>` (cpp#35). The wholesale
+    # `>` veto below (a single segment with a redirect is never tier1-safe and is
+    # always tier3-dangerous) otherwise blocks the dispatch-lib plan-import flow.
+    # The `bash-git-show-redirect` policy rule encodes the FULL safe shape in one
+    # anchored regex — SHA-only (immutable-object) source, literal worktree-
+    # relative target (no absolute/~/.. / shell-expansion) — so honoring its
+    # rule_id here is the same "sanctioned exception to a wholesale veto" pattern
+    # as `_is_sanctioned_pure_heredoc` above. This MUST come AFTER the here-
+    # string / heredoc / substitution-marker / bare-`&` vetoes: those run first,
+    # so a substitution-laden source (`git show abc:$(evil) > x`) is rejected
+    # before reaching here. The rule_id coupling fails CLOSED — if the YAML rule
+    # is renamed or dropped, this never fires and the command routes to the
+    # normal veto (deny), the safe direction.
+    pd = evaluate(policy, tool_name, tool_input)
+    if pd.decision == "allow" and pd.rule_id == "bash-git-show-redirect":
+        return True
 
     segments = _split_compound_command(command)
     if not segments:

@@ -83,6 +83,33 @@ rules:
   # + push. Read-only ops are always safe; commit/push are gated by the
   # slash command's own state machine, not by policy.
 
+  # `git show <SHA>:<path> > <relative-path>` — the dispatch-lib pattern for
+  # re-importing a grooming plan from its source commit into a fresh worktree
+  # (cpp#35; mika-arch session 783d4a04). Must precede bash-git-readonly so the
+  # sanctioned shape claims this rule_id (first-match-wins). SAFE because:
+  #   - source is `[a-f0-9]+:` — an IMMUTABLE git object (a hex commit SHA), not
+  #     a movable branch/tag ref. `HEAD`/`main`/`develop`/`feature/*` do not
+  #     match, closing the ref-mutability TOCTOU (bypass surface B3). Edge: a
+  #     branch literally named with only hex chars (e.g. `abcdef`) would match —
+  #     the architect accepted this pathological edge in the GROOMED verdict.
+  #   - the redirect TARGET is a literal worktree-relative token: leading `/`
+  #     (absolute), leading `~`, and any `..` are rejected by lookaheads; the
+  #     `[\w./-]+` char class excludes `$`, backtick, `(`, space and `>`, so no
+  #     shell expansion / substitution / chaining can ride the target.
+  #   - the SOURCE path char class `[\w./-]+` likewise excludes `$(`/backtick.
+  # Anchored `^...$` is load-bearing: policy.evaluate uses re.search with NO
+  # re.MULTILINE, so `$` honors only a single trailing newline — a multi-line
+  # injection (`> foo\nrm -rf /`) cannot match here and falls through to the
+  # bash-git-readonly path, where _bash_allow_is_chain_safe splits on `\n` and
+  # vetoes the dangerous segment. The chain-safe guard in permissions.py honors
+  # THIS rule_id as a sanctioned exception to its wholesale `>` veto (the only
+  # place that ban is lifted besides the /tmp heredoc) — keep the id in sync.
+  - id: bash-git-show-redirect
+    tool: Bash
+    pattern: '^git\s+show\s+[a-f0-9]+:[\w./-]+\s*>\s*(?!/)(?!~)(?!.*\.\.)[\w./-]+\s*$'
+    decision: allow
+    reason: "git show <SHA>:<path> > <relative-path> -- SHA-only source (immutable git object, no movable-ref TOCTOU), literal redirect target (no absolute / ~ / .. / shell-expansion); permissions.py _bash_allow_is_chain_safe honors this rule_id as a sanctioned redirect (cpp#35)"
+
   - id: bash-git-readonly
     tool: Bash
     pattern: "^git\\s+(status|log|diff|show|branch|rev-parse|fetch|ls-remote|worktree)"
