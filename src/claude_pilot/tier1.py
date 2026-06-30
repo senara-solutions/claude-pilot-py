@@ -122,7 +122,15 @@ TIER3_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\bbash\s+-c\b"),
     re.compile(r"\bsh\s+-c\b"),
     re.compile(r"\beval\s"),
-    re.compile(r"\bxargs\b"),
+    # NOTE: the blanket `\bxargs\b` deny was REMOVED here (cpp#40), for the same
+    # reason the `find … -exec` blanket deny was (cpp#33): it was the SOLE guard
+    # for xargs' inner command, which the header doctrine forbids. xargs safety
+    # now lives in the allow-list layer: `_is_safe_xargs_command()` admits
+    # `xargs [flags] <cmd>` only when `<cmd>` is in the SAME closed-world
+    # FIND_EXEC_SAFE_COMMANDS read-only allowlist `find -exec` uses. `xargs sh -c`
+    # / `xargs bash -c` stay independently caught by the `sh -c`/`bash -c`
+    # patterns just above (defense in depth); `xargs sudo`/`xargs rm` deny because
+    # they are not in the allowlist.
     # NOTE: the blanket `find … -(exec|execdir|delete)` deny was REMOVED here
     # (cpp#33). It was the SOLE protection for find's exec sub-feature, which
     # the TIER3 header doctrine above forbids — a denylist entry must never be
@@ -193,7 +201,13 @@ them — use the auto-approved native tool, which accomplishes the same goal:
   the current worktree — so prefer it for cross-worktree file comparison.
 - In-place edits via `sed -i` → use the **Edit** tool.
 - Writing files via shell redirect (`>`, `>>`) → use the **Write** tool.
-- `xargs`, `eval`, `bash -c`, `sh -c` → use the dedicated native tool
+- `xargs` with a NON-read-only inner command (`xargs rm`, `xargs sh -c …`,
+  `xargs bash -c …`, `xargs sudo …`) → use the dedicated native tool. A read-only
+  inner command (`grep`, `cat`, `head`, `tail`, `ls`, `stat`, `wc`, `echo`, …) IS
+  auto-approved, so `find … | xargs grep -l "pattern"` runs without halting. Still
+  prefer **Grep**/**Glob** for searching, but a read-only `xargs` no longer crashes
+  the session.
+- `eval`, `bash -c`, `sh -c` → use the dedicated native tool
   (Grep/Glob/Read/Edit/Write) for the underlying goal.
 
 Prefer Read, Write, Edit, Grep, and Glob over their shell equivalents: they are
@@ -290,19 +304,34 @@ def _split_compound_command(command: str) -> list[str]:
 
 
 def contains_unquoted_metacharacter(command: str) -> bool:
-    """Return True if *command* contains an unquoted backtick, ``$(`` or ``$'``.
+    """Return True if *command* contains a backtick, ``$(`` or ``$'`` that bash
+    would expand — i.e. anywhere EXCEPT inside single quotes.
 
-    Mirrors ``contains_unquoted_metacharacter`` in
-    ``crates/mika-agent/src/server/permission_pre_classifier.rs`` (mika repo).
-    Quote handling follows POSIX semantics:
+    Bash performs command substitution inside double quotes; only single quotes
+    suppress it. So the name is historical: the function flags substitution
+    markers in unquoted AND double-quoted regions, treating only single-quoted
+    regions as inert. Quote handling follows POSIX semantics:
 
-    - Inside ``"..."`` regions, ``\\"`` is an escape pair (skipped atomically).
+    - Outside quotes, a bare backtick, ``$(`` or ``$'`` returns True.
+    - Inside ``"..."`` regions, a bare backtick or ``$(`` returns True (cpp#41
+      closed the double-quoted gap — bash expands both there). ``$'`` is NOT
+      flagged inside double quotes: ANSI-C ``$'...'`` quoting is only recognized
+      outside quotes, so inside a double-quoted region ``$'`` is literal.
+    - Inside ``"..."`` regions, ``\\X`` is an escape pair (skipped atomically),
+      so a backslash-suppressed ``\\$(``/``\\```` is NOT flagged and ``\\"`` does
+      not close the region.
     - Inside ``'...'`` regions, backslash is literal — ``'foo\\\\'`` closes at
       the second ``'`` and any backtick that follows is unquoted.
     - Unterminated quotes: the scanner treats all remaining bytes as inside the
       quote (conservative — falls through to the LLM relay on malformed input).
 
-    See mika#944 (ANSI-C quoting bypass), mika#946 (mika#938 F5 sentinel).
+    NOTE: the Rust mirror ``contains_unquoted_metacharacter`` in
+    ``crates/mika-agent/src/server/permission_pre_classifier.rs`` (mika repo) does
+    NOT yet detect double-quoted substitution. This Python side intentionally
+    diverges (hardened) until the paired-audit ticket mirrors the cpp#41 fix.
+
+    See mika#944 (ANSI-C quoting bypass), mika#946 (mika#938 F5 sentinel),
+    cpp#41 (double-quoted substitution gap).
     """
     n = len(command)
     i = 0
@@ -311,12 +340,34 @@ def contains_unquoted_metacharacter(command: str) -> bool:
     while i < n:
         ch = command[i]
         if quote_state is not None:
-            # Inside a quoted region — handle escape (double-quoted only) then close.
+            # Inside a quoted region — handle escape (double-quoted only) first.
             if quote_state == '"' and ch == '\\' and i + 1 < n:
+                # Skip the `\X` pair. In bash, `\` inside double quotes suppresses
+                # `$`/backtick, so `"\$(x)"` / "\`x\`" are literal — skipping the
+                # pair correctly prevents flagging a SUPPRESSED substitution. `\"`
+                # likewise does not close the region (handled by skipping here).
                 i += 2
                 continue
             if ch == quote_state:
                 quote_state = None
+                i += 1
+                continue
+            # cpp#41: bash performs command substitution inside DOUBLE quotes —
+            # only SINGLE quotes suppress it. The pre-cpp#41 scanner treated a
+            # double-quoted region as inert and missed `$(`/backtick, so
+            # `grep "$(id)"` auto-approved and bash ran `id`. Scan double-quoted
+            # regions for the two markers bash STILL expands there: `$(` and
+            # backtick. `$'` is deliberately NOT flagged inside double quotes —
+            # ANSI-C `$'...'` quoting is only recognized OUTSIDE quotes; inside a
+            # double-quoted region `$'` is a literal dollar + apostrophe (no
+            # expansion), so flagging it would be a false positive (mika#944's
+            # `$'` guard correctly lives in the UNQUOTED branch only). Single-
+            # quoted regions stay fully inert (bash literal semantics).
+            if quote_state == '"':
+                if ch == "`":
+                    return True
+                if ch == "$" and i + 1 < n and command[i + 1] == "(":
+                    return True
             i += 1
             continue
 
@@ -471,6 +522,11 @@ SAFE_SHELL_COMMANDS: frozenset[str] = frozenset({
     # explicitly. See plan: docs/plans/2026-06-08-001-fix-27-tier1-drop-awk-sed-plan.md
     "ls", "cat", "head", "tail", "wc", "find", "grep",
     "echo", "printf", "dirname", "basename",
+    # `xargs` is NOT read-only on its own — it runs an inner command. Membership
+    # here only passes the SAFE_SHELL_COMMANDS gate; the actual safety decision is
+    # made by the `xargs` special-case in is_safe_shell_command (cpp#40), exactly
+    # like `find` is special-cased to _is_safe_find_command.
+    "xargs",
     "realpath", "readlink", "stat", "file", "which", "type",
     "pwd", "date", "sort", "uniq", "tr", "cut", "diff",
     "comm", "test", "[",
@@ -501,14 +557,27 @@ _FIRST_WORD_RE = re.compile(r"^\s*(\S+)")
 # proven-live RCE (cpp#33 security review). The native Grep tool (ripgrep-backed)
 # covers the search use case without the exec surface.
 #
-# LOAD-BEARING PRECONDITION (cpp#44): `grep`/`egrep`/`fgrep` are read-only ONLY
-# under GNU grep. `ugrep` (a drop-in `grep` on some Gentoo/BSD/Homebrew hosts)
-# adds `--filter=CMD` / `--pager` / `--view`, which execute commands — the same
-# class as `rg --pre`. The pilot runs in standard-Linux containers where
-# `find -exec` resolves to GNU `/bin/grep`, so this is safe in the deployment
-# target; cpp#44 tracks verifying the container grep provider and reconsidering
-# these entries if a ugrep host is ever in scope. Do not add a new grep-family
-# entry without re-checking that precondition.
+# LOAD-BEARING PRECONDITION (cpp#44, RESOLVED): `grep`/`egrep`/`fgrep` are
+# read-only ONLY under GNU grep. `ugrep` (a drop-in `grep` on some
+# Gentoo/BSD/Homebrew hosts) adds `--filter=CMD` / `--pager` / `--view`, which
+# execute commands — the same RCE class as `rg --pre` (which got `rg` dropped in
+# cpp#33). This allowlist also backs `xargs <cmd>` (cpp#40), so the precondition
+# governs both `find -exec grep` and `xargs grep`.
+#
+# Resolution (cpp#44): the cpp#33 security review empirically verified that the
+# pilot's standard-Linux deployment containers resolve `find -exec` to GNU
+# `/bin/grep` 3.12, which REJECTS `--filter`/`--pager`/`--view`. The ugrep exec
+# vector is therefore NOT live in the deployment target. Decision: keep
+# `grep`/`egrep`/`fgrep` (dropping them would defeat cpp#33 — its founding
+# incidents mika#1381/#1572 are exactly `find -exec grep -l`), and treat the
+# GNU-grep premise as an ACCEPTED + tracked risk documented right here.
+#
+# Hardening boundary: NEVER denylist `--filter`/`--pager`/`--view` by parsing the
+# inner command's arguments — inner-arg lexing is forbidden (solution-doc §4). If
+# a host that presents ugrep as `grep` ever enters scope, DROP the grep-family
+# entries instead. A defense-in-depth startup ugrep-detection warning could live
+# in `cli.py` (NOT this pure subprocess-free classifier) and is intentionally not
+# added here. Do not add a new grep-family entry without re-checking this premise.
 FIND_EXEC_SAFE_COMMANDS: frozenset[str] = frozenset({
     "grep", "egrep", "fgrep",
     "cat", "head", "tail", "wc",
@@ -534,6 +603,18 @@ _FIND_WRITE_RE = re.compile(r"-(?:fprintf|fprint0|fprint|fls)\b")
 # folded in here (cpp#33) — they are exec-class (prompt-then-run) and were a
 # pre-existing auto-approval gap when only `-exec`/`-execdir` were guarded.
 _FIND_EXEC_INNER_RE = re.compile(r"-(?:execdir|exec|okdir|ok)\b\s+(\S+)")
+
+
+def _contains_substitution(sub: str) -> bool:
+    """True if *sub* contains any command-substitution marker (`$(`, backtick,
+    `$'`). Used as a defense-in-depth guard by the exec-class allowlist gates
+    (`_is_safe_find_command`, `_is_safe_xargs_command`): a read-only `find`/`xargs`
+    invocation never needs substitution, so its presence smuggles execution.
+    Shared so the two gates cannot drift. Note `is_safe_bash_command` also runs
+    `contains_unquoted_metacharacter` first, which catches unquoted and
+    double-quoted substitution; this substring check additionally vetoes the
+    single-quoted (inert) form — the safe-direction over-block."""
+    return "$(" in sub or "`" in sub or "$'" in sub
 
 
 def _is_safe_find_command(sub: str) -> bool:
@@ -568,10 +649,91 @@ def _is_safe_find_command(sub: str) -> bool:
     if not inner_commands:
         return True  # pure search — no exec-class clause, no -delete
 
-    if "$(" in sub or "`" in sub or "$'" in sub:
+    if _contains_substitution(sub):
         return False
 
     return all(inner in FIND_EXEC_SAFE_COMMANDS for inner in inner_commands)
+
+
+# `xargs` short flags that take a REQUIRED SEPARATE value token (e.g. `-I {}`,
+# `-n 1`, `-d ,`, `-P 4`). When one of these appears as its own token, the NEXT
+# token is its value, not the inner command — skip both. Attached forms (`-n1`,
+# `-I{}`, `-P4`) and value-less flags (`-0`, `-r`, `-t`, `-x`, `-p`) are a single
+# token and skip just themselves.
+#
+# This set lists ONLY getopt *required-argument* short flags. The deprecated
+# `-e[eof]`/`-i[replace]`/`-l[lines]` are getopt *optional-argument* forms — an
+# optional argument is taken ONLY when attached (`-i{}`), NEVER as a separate
+# token. They are deliberately EXCLUDED: if they were here, `xargs -i rm cat`
+# would skip `-i` AND `rm` (treating the real command `rm` as `-i`'s value) and
+# allow on `cat` — a confirmed auto-approval of `rm` (cpp#40 security review, P0).
+# Excluded, they fall to the single-token skip below, so `xargs -i rm cat`
+# correctly evaluates `rm` and denies. This is a parser-arity contract with GNU
+# getopt; over-block is the safe direction, NEVER under-block.
+_XARGS_VALUE_FLAGS: frozenset[str] = frozenset(
+    {"-a", "-d", "-E", "-I", "-L", "-n", "-P", "-s"}
+)
+
+
+def _is_safe_xargs_command(sub: str) -> bool:
+    """Decide whether an `xargs` invocation is safe to auto-approve (cpp#40).
+
+    Sibling to `_is_safe_find_command`: `xargs [flags] <cmd> …` runs `<cmd>` for
+    each stdin record, so the safety question is identical to `find -exec <cmd>`.
+    Allow iff the first non-flag token after `xargs` (the executed binary) is in
+    the SAME closed-world FIND_EXEC_SAFE_COMMANDS read-only allowlist. We skip
+    xargs' own flags structurally (see _XARGS_VALUE_FLAGS) but never parse the
+    inner command's arguments — exact-literal match only, no inner lexing.
+
+    Denies:
+    - any command substitution (`$(`, backtick, `$'`) anywhere — a read-only
+      `xargs grep …` never needs it; its presence smuggles execution (mirrors
+      `_is_safe_find_command`; also caught at the scanner layer by cpp#41).
+    - `xargs sh -c`/`xargs bash -c` (sh/bash not in the allowlist; also caught by
+      the TIER3 `sh -c`/`bash -c` patterns — defense in depth).
+    - `xargs sudo`/`xargs rm`/etc. (not in the allowlist).
+    - a bare `xargs` with no inner command (defaults to `echo`, but ambiguous →
+      over-block is the safe default).
+    """
+    if _contains_substitution(sub):
+        return False
+
+    tokens = sub.split()
+    if not tokens or tokens[0] != "xargs":
+        return False
+
+    i = 1
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok == "--":  # explicit end-of-options; next token is the command
+            i += 1
+            break
+        if tok.startswith("--"):
+            # GNU long option. A getopt long option's value may be SEPARATE
+            # (`--arg-file cat`) or `=form` (`--arg-file=cat`); we cannot know a
+            # given option's arity without a full getopt table, and assuming
+            # `=form`-only let `xargs --arg-file cat rm` skip just `--arg-file`,
+            # land on `cat`, and allow while real xargs runs `rm` (cpp#40 security
+            # review, P0). `=form` packs the value into this one token, so the
+            # NEXT token is reliably the command/another flag → skip one. A BARE
+            # `--long` has unknowable arity → deny (over-block). The inner command
+            # may still follow `--` or an `=form` option.
+            if "=" in tok:
+                i += 1
+                continue
+            return False
+        if tok.startswith("-"):
+            if tok in _XARGS_VALUE_FLAGS:  # separate-value short flag → skip value
+                i += 2
+                continue
+            i += 1  # attached-value or value-less short flag → single token
+            continue
+        return tok in FIND_EXEC_SAFE_COMMANDS  # first non-flag token = inner cmd
+
+    if i < len(tokens):  # token immediately after `--`
+        return tokens[i] in FIND_EXEC_SAFE_COMMANDS
+
+    return False  # no inner command found → deny
 
 
 def is_safe_shell_command(sub: str) -> bool:
@@ -585,6 +747,9 @@ def is_safe_shell_command(sub: str) -> bool:
 
     if cmd == "find":
         return _is_safe_find_command(sub)
+
+    if cmd == "xargs":
+        return _is_safe_xargs_command(sub)
 
     return True
 
