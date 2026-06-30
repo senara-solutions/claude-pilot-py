@@ -17,6 +17,7 @@ from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 from claude_agent_sdk.types import ToolPermissionContext
 
 from claude_pilot.permissions import (
+    _SUBSTITUTION_ALLOWLIST,
     _bash_allow_is_chain_safe,
     create_permission_handler,
 )
@@ -105,6 +106,63 @@ def test_guard_vetoes_command_substitution_even_double_quoted() -> None:
 def test_guard_no_false_positive_on_var_expansion() -> None:
     cmd = 'export PATH="$HOME/.local/bin:$PATH" && which npm'
     assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is True
+
+
+# --- cpp#34: closed-world substitution-inner allowlist (mika-arch 783d4a04) ---
+# The blanket ``$(`` veto admits a narrow closed world of whole-token literals:
+# read-only git plumbing substitutions feeding a read-only outer command. Match
+# is exact-literal; anything off the list still vetoes. Tests import the
+# production ``_SUBSTITUTION_ALLOWLIST`` so they exercise the real list, not a
+# drifting copy.
+
+
+def test_guard_allows_gh_pr_read_with_branch_substitution() -> None:
+    # AC1 — the cpp#34 production trigger (mika#1617 dispatch). Read-only outer
+    # (`bash-gh-pr-read` allow) + allowlisted read-only git substitution → honored.
+    cmd = (
+        "gh pr list --head $(git branch --show-current) "
+        "--json baseRefName --jq '.[0].baseRefName'"
+    )
+    assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is True
+
+
+def test_guard_allows_each_allowlisted_substitution_token() -> None:
+    # Every enumerated token, embedded in a read-only `gh pr view` outer, is honored.
+    for token in _SUBSTITUTION_ALLOWLIST:
+        cmd = f"gh pr view --head {token}"
+        assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is True, token
+
+
+def test_guard_redaction_does_not_short_circuit_chain_check() -> None:
+    # Substitution is allowlisted, but after redaction the trailing `_SUB_` is an
+    # unknown segment — the chain check must still run and veto. (Proves we do not
+    # `return True` on an allowlist hit.)
+    cmd = "git status && $(git branch --show-current)"
+    assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is False
+
+
+def test_guard_vetoes_whitespace_variant_of_allowlisted_token() -> None:
+    # Extra spaces inside the token are NOT the canonical literal → no match → veto.
+    cmd = "gh pr list --head $( git branch --show-current )"
+    assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is False
+
+
+def test_guard_vetoes_readonly_substitution_not_on_allowlist() -> None:
+    # `$(git status)` is read-only but NOT enumerated — closed world means veto.
+    cmd = "gh pr list --head $(git status)"
+    assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is False
+
+
+def test_guard_vetoes_nested_substitution() -> None:
+    # Nested `$(` matches no allowlist token; a `$(` survives redaction → veto.
+    cmd = "gh pr view $(echo $(rm -rf /))"
+    assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is False
+
+
+def test_guard_vetoes_allowlisted_mixed_with_evil_substitution() -> None:
+    # Redacting the allowlisted token leaves the evil `$(curl evil)` behind → veto.
+    cmd = "gh pr list --head $(git branch --show-current) --body $(curl evil)"
+    assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is False
 
 
 def test_guard_exempts_sole_command_heredoc() -> None:

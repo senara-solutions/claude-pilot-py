@@ -1,12 +1,13 @@
 ---
 title: "Command-string policy allow rules are compound-unsafe; never lex shell grammar in a security gate"
 date: 2026-06-03
+last_updated: 2026-06-30
 module: claude_pilot.policy
 component: permission-classifier
 problem_type: security_issue
 category: security-issues
 severity: critical
-tags: [permissions, policy, bash, regex, heredoc, allow-list, rce, claude-pilot-25]
+tags: [permissions, policy, bash, regex, heredoc, allow-list, rce, claude-pilot-25, claude-pilot-34, command-substitution]
 applies_when: "adding or reviewing any rule that decides allow/deny on a raw shell command string"
 ---
 
@@ -89,10 +90,73 @@ adversarial reviewer **running** candidate command strings (several against real
 bash), not by reading the diff. Budget multiple executed-exploit passes for any
 change to the safety surface; treat "I reasoned it's safe" as unproven.
 
+### 4. Relax the gate with a closed-world allowlist of whole substitution tokens — never by lexing the inside
+
+The blanket "veto on any `$(`/backtick/`$'`" (guidance §1) over-blocks legitimate
+read-only dispatch commands like `gh pr list --head $(git branch --show-current)`.
+The wrong fix is a recursive validator that parses the substitution's *inner*
+command to decide if it's safe — that re-introduces exactly the shell-lexer the
+heredoc lesson (§2) says to remove, and a parser differential becomes a bypass.
+The sound relaxation (claude-pilot#34) keeps the syntactic crudeness and admits a
+**closed-world allowlist of exact-literal whole tokens**:
+
+```python
+# Backtick / $' are never allowlistable — veto before any redaction runs.
+if "`" in command or "$'" in command:
+    return False
+# For $( : redact each allowlisted WHOLE token to an inert placeholder, then
+# require that NO $( survives. Anything not exactly on the list keeps its $( and vetoes.
+if "$(" in command:
+    redacted = _redact_allowlisted_substitutions(command)   # str.replace, exact substring
+    if redacted is None:                                    # an unrecognized $( remained
+        return False
+    command = redacted                                      # carry _SUB_ placeholders onward
+# DO NOT return True here — fall through to the existing per-segment chain check.
+```
+
+Three properties make it sound (an adversarial pass crafted 7 bypass classes —
+substring-boundary differential, redaction-creating-a-new-marker, `_SUB_`-as-a-segment,
+mixed allowlisted+evil, arg-position into a write-capable outer, nesting, backtick/`$'`
+— and broke none):
+
+1. **Inert payloads.** Each allowlisted inner command is read-only git plumbing
+   (`git branch --show-current`, `git rev-parse [--short|--abbrev-ref] HEAD`) emitting a
+   single short identifier. Bash never re-parses command-substitution *output* as code,
+   so the substituted value can't smuggle operators.
+2. **Whole-token literal redaction to a metacharacter-free placeholder.** Match the
+   *entire* token by exact string equality (`str.replace`), not a regex on its inner
+   content — so `$( git … )` with extra spaces, or `$(git status)` (read-only but not
+   enumerated), never matches. The `_SUB_` placeholder has no shell metacharacters, so it
+   can't create a chain break (`&&`/`;`/`|`/newline/`&`), can't match any tier1 safe-list
+   or policy allow rule, and can't desync the segment splitter. A residual-`$(` re-check
+   after redaction catches every nested / mixed / off-allowlist / quoted form.
+3. **Asymmetric matching, and no short-circuit.** The outer policy `allow` matches the
+   *original* command (token spaces intact, so an anchored `\S+`-style pattern can't
+   over-match across the substitution); the per-segment chain check matches the *redacted*
+   command. Crucially, an allowlist hit does **not** `return True` — it falls through to
+   the segment loop, so `git status && $(git branch --show-current)` redacts to
+   `git status && _SUB_` and still vetoes on the unknown `_SUB_` segment.
+
+The closed world is the point: over-blocking is the correct failure mode. Adding an
+entry is an evidence-gated follow-up, and every candidate must satisfy all of:
+read-only inner command, single short-identifier stdout, and no nested `$(`/backtick/
+redirect/pipe inside it. See `_SUBSTITUTION_ALLOWLIST` / `_redact_allowlisted_substitutions`
+in `src/claude_pilot/permissions.py`.
+
+**Latent surface (not covered today):** bash-5.3 funsub forms `${ cmd;}` / `${|cmd}`
+and `${IFS}` are inspected by neither this gate nor tier1's
+`contains_unquoted_metacharacter` (both key on `$(`). They are *incidentally* vetoed
+now — the quote/brace-blind compound splitter shreds them on their internal `;`/`|` —
+so there is no live hole, but a future change to the splitter could open one. Flagged
+for awareness, not action.
+
 ## When to Apply
 
 - Adding/reviewing any `permissions.yaml` rule, or any code deciding allow/deny on
   a raw shell command string.
+- Relaxing the substitution veto: the only safe shape is a closed-world allowlist of
+  whole-token literals redacted to an inert placeholder, never a validator that lexes
+  the substitution's inner command (§4).
 - Reviewing `tier1.py` / `policy.py` / `permissions.py` in claude-pilot.
 
 ## Related
