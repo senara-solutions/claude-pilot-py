@@ -127,6 +127,22 @@ _SUBSTITUTION_ALLOWLIST = (
 # --show-current)`` correctly vetoes once redacted to ``git status && _SUB_``.
 _SUBSTITUTION_PLACEHOLDER = "_SUB_"
 
+# bash 5.3 K-style command substitution opener (cpp#37). ``${ command; }`` and
+# ``${| command; }`` run ``command`` and substitute its stdout — equivalent
+# injection power to ``$(...)`` — and are NOT allowlistable (same class as
+# backtick / ``$'``). This matches the OPENING TOKEN SHAPE only, never the body:
+# bash 5.3 distinguishes a funsub from ``${name}`` parameter expansion purely by
+# the byte after ``${`` — funsub requires whitespace (space / tab / newline) or
+# ``|``, whereas parameter expansion (``${HOME}``, ``${#arr[@]}``, ``${VAR:-x}``)
+# requires an identifier or special-parameter char. So ``\$\{`` followed by
+# ``[\s|]`` is an unambiguous funsub marker; it can never collide with a legitimate
+# ``${name}``. ``\s`` is a superset of bash's blank set (it also covers CR/FF/VT) —
+# over-matching here only ever vetoes (the safe direction) and cannot block a real
+# parameter expansion, which never has whitespace after ``${``. No funsub
+# allowlist exists; like ``$(``, any future safe-funsub allowance is a separate
+# evidence-gated ticket (cpp#34 closed-world discipline, mika-arch 783d4a04).
+_FUNSUB_OPENER_RE = re.compile(r"\$\{[\s|]")
+
 
 def _redact_allowlisted_substitutions(command: str) -> str | None:
     """Redact allowlisted ``$(...)`` tokens, or signal an unrecognized one.
@@ -210,14 +226,16 @@ def _bash_allow_is_chain_safe(
         # cat-heredoc (delimiter fixed to EOF). Everything else routes to relay.
         return _is_sanctioned_pure_heredoc(command)
 
-    # Command substitution. Backtick / ``$'`` forms are never allowlistable →
-    # veto outright. For ``$(`` forms, admit only the closed-world allowlist:
-    # redact each allowlisted whole-token to an inert ``_SUB_`` placeholder, then
-    # let the per-segment chain check below run on the redacted command. We do
-    # NOT short-circuit ``return True`` — the redacted command still needs full
-    # chain-safety (e.g. ``git status && $(git branch --show-current)`` becomes
-    # ``git status && _SUB_``, whose ``_SUB_`` segment fails the segment check).
-    if "`" in command or "$'" in command:
+    # Command substitution. Backtick / ``$'`` / bash 5.3 K-style funsub (``${ … }``)
+    # forms are never allowlistable → veto outright. For ``$(`` forms, admit only
+    # the closed-world allowlist: redact each allowlisted whole-token to an inert
+    # ``_SUB_`` placeholder, then let the per-segment chain check below run on the
+    # redacted command. We do NOT short-circuit ``return True`` — the redacted
+    # command still needs full chain-safety (e.g. ``git status && $(git branch
+    # --show-current)`` becomes ``git status && _SUB_``, whose ``_SUB_`` segment
+    # fails the segment check). The funsub veto is keyed on the opener token only
+    # (``_FUNSUB_OPENER_RE``); it leaves ``${name}`` parameter expansion untouched.
+    if "`" in command or "$'" in command or _FUNSUB_OPENER_RE.search(command):
         return False
     if "$(" in command:
         redacted = _redact_allowlisted_substitutions(command)
