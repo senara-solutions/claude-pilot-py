@@ -232,14 +232,22 @@ def _bash_allow_is_chain_safe(
     # always tier3-dangerous) otherwise blocks the dispatch-lib plan-import flow.
     # The `bash-git-show-redirect` policy rule encodes the FULL safe shape in one
     # anchored regex — SHA-only (immutable-object) source, literal worktree-
-    # relative target (no absolute/~/.. / shell-expansion) — so honoring its
-    # rule_id here is the same "sanctioned exception to a wholesale veto" pattern
-    # as `_is_sanctioned_pure_heredoc` above. This MUST come AFTER the here-
-    # string / heredoc / substitution-marker / bare-`&` vetoes: those run first,
-    # so a substitution-laden source (`git show abc:$(evil) > x`) is rejected
-    # before reaching here. The rule_id coupling fails CLOSED — if the YAML rule
-    # is renamed or dropped, this never fires and the command routes to the
-    # normal veto (deny), the safe direction.
+    # relative target (rejects absolute/`~`/literal-`..`/shell-expansion) — so
+    # honoring its rule_id here is the same "sanctioned exception to a wholesale
+    # veto" pattern as `_is_sanctioned_pure_heredoc` above. This MUST come AFTER
+    # the here-string / heredoc / substitution-marker / bare-`&` vetoes: those run
+    # first, so a substitution-laden source (`git show abc:$(evil) > x`) is
+    # rejected before reaching here. The rule_id coupling fails CLOSED — if the
+    # YAML rule is renamed or dropped, this never fires and the command routes to
+    # the normal veto (deny), the safe direction.
+    #
+    # RESIDUAL (accepted, mika-arch session fe891012): the rule's static target
+    # check rejects literal `../` but CANNOT detect SYMLINK traversal — a relative
+    # target through a committed symlink (`> esc/passwd`, esc -> ../OUTSIDE) writes
+    # outside the worktree. Same symlink-blind residual the deployed `bash-cp-mv`/
+    # `bash-mkdir` rules already carry (static policy is a pre-exec shape filter,
+    # not a runtime sandbox). Worktree containment is a runtime concern (cf. the
+    # Write tool's `is_within_project`); closing it policy-wide is tracked in cpp#38.
     pd = evaluate(policy, tool_name, tool_input)
     if pd.decision == "allow" and pd.rule_id == "bash-git-show-redirect":
         return True

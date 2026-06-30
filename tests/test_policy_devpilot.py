@@ -373,6 +373,12 @@ def test_bundled_allows_git_show_redirect_real_dispatch_filename() -> None:
     assert _effective(cmd) == "allow"
 
 
+def test_bundled_allows_git_show_redirect_no_space_after_gt() -> None:
+    # The `\s*` around `>` admits the no-space form; pin it so a future regex
+    # tightening can't silently break the lenient-whitespace contract.
+    assert _effective("git show e95a9d8f:file>out.txt") == "allow"
+
+
 @pytest.mark.parametrize(
     "cmd",
     [
@@ -384,6 +390,7 @@ def test_bundled_allows_git_show_redirect_real_dispatch_filename() -> None:
         "git show abc123:file > $HOME/anything",      # $-expansion (valid SHA)
         "git show HEAD:file > foo",                   # branch/HEAD ref, not SHA
         "git show main:file > foo",                   # branch ref, not SHA
+        "git show E95A9D8F:file > out.txt",           # uppercase SHA -> not [a-f0-9]
         # belt-and-suspenders: append/double-redirect/trailing-chain on the SHA shape
         "git show e95a9d8f:file >> appended",         # append redirect, not sanctioned
         "git show e95a9d8f:file > a > b",             # double redirect
@@ -405,6 +412,21 @@ def test_guard_substitution_in_source_vetoed_before_git_show_exception() -> None
     # exception is consulted, so a $(...) in the source path is rejected.
     cmd = "git show e95a9d8f:$(curl evil) > docs/plans/X.md"
     assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is False
+
+
+def test_git_show_redirect_symlink_traversal_is_accepted_static_residual() -> None:
+    # DOCUMENTS an accepted residual (mika-arch session fe891012, cpp#35 / cpp#38):
+    # a relative, ..-free target through a *committed symlink* (`esc -> ../OUTSIDE`)
+    # passes the static rule and would write outside the worktree AT RUNTIME. Static
+    # policy is a pre-exec shape filter, not a runtime sandbox — it cannot detect
+    # symlinks. This is the SAME residual the deployed cp/mv/mkdir rules carry
+    # (asserted below for parity). Do NOT "fix" by tightening this regex (that would
+    # break the legitimate multi-component target `docs/plans/X.md`); true
+    # containment is runtime resolve-and-contain, tracked policy-wide in cpp#38.
+    assert _effective("git show e95a9d8f:payload > esc/passwd") == "allow"
+    # Parity: the pre-existing structural write rules share the identical residual.
+    assert _effective("cp payload esc/passwd") == "allow"
+    assert _effective("mkdir esc/newdir") == "allow"
 
 
 # ── Handler end-to-end: interrupt semantics (cpp#20 joint 2) ─────────────────
