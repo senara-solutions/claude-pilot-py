@@ -231,10 +231,14 @@ def _bash_allow_is_chain_safe(
     # `>` veto below (a single segment with a redirect is never tier1-safe and is
     # always tier3-dangerous) otherwise blocks the dispatch-lib plan-import flow.
     # The `bash-git-show-redirect` policy rule encodes the FULL safe shape in one
-    # anchored regex — SHA-only (immutable-object) source, literal worktree-
-    # relative target (rejects absolute/`~`/literal-`..`/shell-expansion) — so
-    # honoring its rule_id here is the same "sanctioned exception to a wholesale
-    # veto" pattern as `_is_sanctioned_pure_heredoc` above. This MUST come AFTER
+    # anchored regex. NOTE the source is NOT immutable: the `[a-f0-9]+` shape
+    # matches a full SHA, an abbreviated SHA, OR a hex-named branch/tag, and
+    # `git show deadbeef:f` resolves `deadbeef` as a mutable, force-pushable
+    # branch (git prefers the ref; cpp#43). Safety therefore rests SOLELY on the
+    # literal worktree-relative target (rejects absolute/`~`/literal-`..`/shell-
+    # expansion), never on source-immutability — so honoring its rule_id here is
+    # the same "sanctioned exception to a wholesale veto" pattern as
+    # `_is_sanctioned_pure_heredoc` above. This MUST come AFTER
     # the here-string / heredoc / substitution-marker / bare-`&` vetoes: those run
     # first, so a substitution-laden source (`git show abc:$(evil) > x`) is
     # rejected before reaching here. The rule_id coupling fails CLOSED — if the
