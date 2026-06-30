@@ -94,6 +94,56 @@ CanUseTool = Callable[
 # Command-substitution markers forbidden on the policy-allow path.
 _SUBSTITUTION_MARKERS = ("$(", "`", "$'")
 
+# Closed-world allowlist of whole command-substitution tokens that are known
+# safe to embed in a policy-allowed command (cpp#34, mika-arch session
+# 783d4a04). Each entry is matched by EXACT LITERAL STRING EQUALITY of the entire
+# ``$(...)`` token — never by lexing or regex on the inner content. That whole-
+# token literal match is the load-bearing invariant: bash either substitutes this
+# exact byte sequence or it does not, so the gate's notion of the token cannot
+# diverge from bash's (no parser differential). Each enumerated inner command is
+# strictly read-only git plumbing, emits a single short identifier on stdout, and
+# itself contains no nested ``$(``, backtick, redirect, or pipe — the properties
+# that make it safe to treat as an opaque, side-effect-free literal.
+#
+# CLOSED WORLD: this list is exhaustive on purpose. A substitution that is merely
+# read-only but not enumerated here (e.g. ``$(git status)``) is still vetoed.
+# Over-blocking is the correct posture. Adding an entry is a separate, evidence-
+# gated follow-up ticket — never an inline edit — and each candidate must satisfy
+# the per-entry invariants above. Backtick and ``$'`` forms are NOT allowlistable.
+_SUBSTITUTION_ALLOWLIST = (
+    "$(git branch --show-current)",
+    "$(git rev-parse --abbrev-ref HEAD)",
+    "$(git rev-parse HEAD)",
+    "$(git rev-parse --short HEAD)",
+)
+
+# Inert placeholder a redacted substitution collapses to. Identifier-shaped with
+# no shell metacharacters, so it can neither introduce a new chain break / marker
+# nor desync the segment splitter. As a standalone segment it matches no tier1
+# allow-list entry and no policy allow rule, so ``git status && $(git branch
+# --show-current)`` correctly vetoes once redacted to ``git status && _SUB_``.
+_SUBSTITUTION_PLACEHOLDER = "_SUB_"
+
+
+def _redact_allowlisted_substitutions(command: str) -> str | None:
+    """Redact allowlisted ``$(...)`` tokens, or signal an unrecognized one.
+
+    Replaces every occurrence of each allowlisted token (exact substring, no
+    lexing) with ``_SUB_``. Returns the redacted command only when **no** ``$(``
+    survives — meaning every command substitution present was on the closed-world
+    allowlist. Returns ``None`` when an unrecognized ``$(`` remains (nested,
+    off-allowlist, whitespace variant, or mixed allowlisted + evil), so the caller
+    vetoes. The caller handles backtick / ``$'`` forms before reaching here — this
+    is keyed on ``$(`` only.
+    """
+    redacted = command
+    for token in _SUBSTITUTION_ALLOWLIST:
+        redacted = redacted.replace(token, _SUBSTITUTION_PLACEHOLDER)
+    if "$(" in redacted:
+        return None
+    return redacted
+
+
 # A bare ``&`` used as a backgrounding separator (not ``&&``, not an fd-dup like
 # ``2>&1`` / ``>&2`` / ``&>``). Splitting on it is unsafe (would break fd-dups),
 # so we reject any command that contains one — a policy-allowed dev command
@@ -157,8 +207,20 @@ def _bash_allow_is_chain_safe(
         # cat-heredoc (delimiter fixed to EOF). Everything else routes to relay.
         return _is_sanctioned_pure_heredoc(command)
 
-    if any(marker in command for marker in _SUBSTITUTION_MARKERS):
+    # Command substitution. Backtick / ``$'`` forms are never allowlistable →
+    # veto outright. For ``$(`` forms, admit only the closed-world allowlist:
+    # redact each allowlisted whole-token to an inert ``_SUB_`` placeholder, then
+    # let the per-segment chain check below run on the redacted command. We do
+    # NOT short-circuit ``return True`` — the redacted command still needs full
+    # chain-safety (e.g. ``git status && $(git branch --show-current)`` becomes
+    # ``git status && _SUB_``, whose ``_SUB_`` segment fails the segment check).
+    if "`" in command or "$'" in command:
         return False
+    if "$(" in command:
+        redacted = _redact_allowlisted_substitutions(command)
+        if redacted is None:
+            return False  # an unrecognized ``$(`` substitution remains
+        command = redacted
     if _BARE_AMP_RE.search(command):
         return False
 
