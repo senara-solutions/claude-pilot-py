@@ -281,6 +281,30 @@ precondition above now governs **both** `find -exec grep` and `xargs grep`. When
 allowlist gets a second consumer, the read-only premise of every entry must hold for
 the new front-end too — here it does, because both run the inner command directly.
 
+**"Structural flag-skipping" IS a parser differential — and the security review
+proved it (cpp#40, two P0s found post-implementation).** The first cut called the
+flag-skipper "structural pattern matching, not a bash lexer" and assumed that made
+it safe. But to *skip* a flag you must know its **arity**, and a flag-arity table is
+a parser model of `getopt` — diverge from real `getopt` and the inner command moves.
+Two divergences each auto-approved `rm` (confirmed live):
+- **Optional-argument short flags** (`-e[eof]`/`-i[replace]`/`-l[lines]`): `getopt`
+  takes their value ONLY when attached (`-i{}`), never as a separate token. Modeling
+  them as separate-value made `xargs -i rm cat` skip `-i` **and** `rm` (the real
+  command, read as `-i`'s value) and allow on `cat`.
+- **Separate-value long options** (`--arg-file cat`): `getopt_long` accepts the value
+  as a separate token, not only `=form`. Assuming `=form`-only made `xargs --arg-file
+  cat rm` skip just `--arg-file`, land on `cat`, and allow while xargs runs `rm`.
+
+The fix direction is the same closed-world instinct applied to **arity**: enumerate
+only the flags whose arity you're certain of (`getopt` *required*-argument short
+flags), treat every *uncertain* token as the command (deny if mutating), and **deny
+on any construct whose arity you can't determine** — a bare `--long` (unknowable
+without the full option table) denies; only `--`-terminated or `=form` inner commands
+are admitted. Over-block on arity uncertainty, never under-block. Lesson: skipping
+tokens by flag class is parsing; hold it to the same "no parser differential" bar as
+§2/§4, and pin it with executed-exploit review (§3) against the **real** `getopt`,
+not your model of it.
+
 ### 7. A regex's syntactic shape is not a runtime-identity guarantee — document what the matched bytes can REFER TO, not what they look like
 
 The `bash-git-show-redirect` rule (§5, cpp#35) matches `^git show [a-f0-9]+:`.
@@ -477,8 +501,11 @@ the Python side intentionally diverges (hardened) until the Rust side mirrors.
   inert inside double quotes; `$(`/backtick are not) (§10).
 - Relaxing a blanket deny by reusing an existing allowlist for a new front-end (e.g.
   `xargs` reusing `FIND_EXEC_SAFE_COMMANDS`): re-confirm every entry's read-only
-  premise holds for the new consumer, and skip the new command's flags structurally,
-  never lexing the inner command (§4, §6).
+  premise holds for the new consumer (§6), and when the front-end has flags, treat
+  flag-skipping as parsing — enumerate only flags whose `getopt` arity is certain,
+  deny on any token whose arity you can't determine (bare `--long`, optional-arg
+  short flags), and pin it with executed-exploit review against the real `getopt`
+  (§6 "structural flag-skipping IS a parser differential").
 - Reviewing `tier1.py` / `policy.py` / `permissions.py` in claude-pilot.
 
 ## Related
