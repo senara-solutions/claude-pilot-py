@@ -7,7 +7,7 @@ component: permission-classifier
 problem_type: security_issue
 category: security-issues
 severity: critical
-tags: [permissions, policy, bash, regex, heredoc, allow-list, rce, symlink, toctou, command-substitution, find-exec, xargs, ugrep, double-quote, ref-resolution, make, funsub, bash-5.3, claude-pilot-25, claude-pilot-33, claude-pilot-34, claude-pilot-35, claude-pilot-37, claude-pilot-40, claude-pilot-41, claude-pilot-43, claude-pilot-44, claude-pilot-45, claude-pilot-47]
+tags: [permissions, policy, bash, regex, heredoc, allow-list, rce, symlink, toctou, command-substitution, find-exec, xargs, ugrep, double-quote, ref-resolution, make, funsub, bash-5.3, worktree-containment, control-plane, claude-pilot-25, claude-pilot-33, claude-pilot-34, claude-pilot-35, claude-pilot-37, claude-pilot-38, claude-pilot-40, claude-pilot-41, claude-pilot-42, claude-pilot-43, claude-pilot-44, claude-pilot-45, claude-pilot-47]
 applies_when: "adding or reviewing any rule that decides allow/deny on a raw shell command string"
 ---
 
@@ -203,8 +203,10 @@ state, name the layer that actually enforces it.** Here, true worktree
 containment is a *runtime* concern: the Write native tool (the documented
 substitute for `>` redirects) already enforces it via `is_within_project`
 (`Path.resolve(strict=False)` + containment), so shell redirects are strictly
-weaker than the tool they substitute for. Closing it policy-wide (resolve-and-
-contain on every write rule's destination) is tracked in cpp#38.
+weaker than the tool they substitute for. This was closed policy-wide in cpp#38
+by porting that same resolve-and-contain to every write rule's destination — see
+§11 for the runtime validator and the higher-severity control-plane class it also
+closes (cpp#42).
 
 Corollary: don't write a comment that claims a stronger guarantee than the
 mechanism delivers. An overstated "closes B2" in a security rule is worse than no
@@ -477,7 +479,82 @@ must auto-approve should single-quote the payload. The Rust mirror
 (`permission_pre_classifier.rs`) has the same gap and is the paired-audit follow-up;
 the Python side intentionally diverges (hardened) until the Rust side mirrors.
 
+### 11. Filesystem-dependent guarantees go in code at the honoring point, not the YAML — one validator, two ordered checks
+
+§5 named the rule: when a security guarantee depends on filesystem state, name —
+and build — the layer that enforces it. cpp#38 + cpp#42 are that layer for the
+three write-capable structural rules (`bash-git-show-redirect`, `bash-cp-mv`,
+`bash-mkdir`). Two distinct residuals, both invisible to a string filter, both
+closed by **one** validator (`permissions.py` `_destination_veto_reason`):
+
+- **cpp#38 — out-of-worktree write via committed symlink.** A relative,
+  `..`-free target through `esc -> ../OUTSIDE` resolves outside the worktree.
+- **cpp#42 — in-worktree control-plane write (higher severity, no pre-plant).**
+  `git show <SHA>:x > .git/hooks/post-checkout` resolves *genuinely inside* the
+  worktree, so a containment check passes it — yet the write executes on next
+  checkout / in CI / rewrites the agent's own slash commands and bundled skills.
+  Reachable with just a path string; a containment-only fix does **not** catch it.
+
+Design points worth keeping:
+
+1. **One chokepoint, not per-rule call sites.** All three rules can only reach an
+   `allow` through the Tier-2 policy path (`cp`/`mv`/`mkdir` are absent from
+   tier1's `SAFE_SHELL_COMMANDS`; `git show … >` is rejected by tier1's
+   metacharacter scan). So the validator runs once, in the handler, right after
+   `_bash_allow_is_chain_safe`, where every write-capable allow is honored and
+   nowhere else. A future write-capable rule inherits the check for free.
+2. **Classify write-capability STRUCTURALLY (leading command word), NEVER by the
+   matched `rule_id`.** This is the subtle one — the first cut keyed on
+   `evaluate(seg).rule_id ∈ {cp-mv, mkdir, …}`, and a cross-model adversarial pass
+   broke it: `policy.evaluate` is first-match-wins `re.search`, and a benign
+   earlier rule **shadows** the write rule while bash still performs the write.
+   `bash-grep`'s `\sgrep\s` matches ` grep ` *anywhere*, so
+   `cp "payload grep x" .git/hooks/post-checkout` evaluates to `rule_id=bash-grep`
+   → a rule-id gate skips the segment → the control-plane write is allowed (no
+   symlink, no pre-plant). The matched rule is **not** what bash executes; the
+   literal leading command word is. The whole command is already established
+   allow + chain-safe by the handler, so classification only has to answer "what
+   does bash write here," and that is a property of the command shape, not the
+   policy's first-match. (`git show … >` is immune — its `>` forces chain-safety
+   to demand the `bash-git-show-redirect` rule_id specifically and any shadow
+   makes the `>` tier3-dangerous — but the no-redirect writers cp/mv/mkdir were
+   wide open.) Generalizes §1's "denylist is incomplete by nature": a *first-match
+   allowlist* is just as unsound a basis for a security *classification*.
+3. **Tokenize operands with `shlex`, not `str.split`.** The same ` grep ` shadow
+   trick puts spaces in an operand, and a naive split fragments a quoted path
+   (`cp src "esc/a grep b"` → `"esc/a`, `b"`) so the symlink/control-plane
+   component is never resolved. POSIX `shlex.split` recovers the operand bash
+   actually sees; a tokenization error (unbalanced quotes) fails closed.
+4. **Order is load-bearing: containment FIRST, control-plane SECOND.** Containment
+   is the safety boundary; the denylist is layered policy on an *already-contained*
+   path. A symlink that escapes the worktree AND looks control-plane must be
+   reported as a containment failure, not mislabeled.
+5. **The validator needs `cwd`; the YAML rule cannot resolve the filesystem.**
+   This is why the guarantee lives in code at the honoring point, not in the
+   pattern. The rule stays a shape filter; the comment points at the code.
+6. **Match the canonical worktree-relative path, not the raw string.** Resolve,
+   then `relative_to(worktree_root)`, then literal-prefix match — so a symlink
+   resolving *into* `.git/` is still denied. Anchor each entry with `(/|$)`, not a
+   bare trailing `/`: a trailing-slash-only `^\.git/` misses the **bare** target
+   (`cp source .git`, `cp -t .claude x`, `git show … > .git`) — which overwrites
+   the gitdir pointer or writes *into* the control-plane dir — while `(/|$)` still
+   lets top-level `.gitignore` through (the char after `.git` is `i`, not `/`/end).
+   The `cp -t DIR` / bare-destination form is the evasion this closes.
+7. **Fail closed on unparseable destinations**, and keep the control-plane
+   denylist a small symbolic constant with per-entry rationale — broaden only
+   with evidence. The accepted residual is `Path.resolve` TOCTOU (a symlink
+   swapped between check and exec), identical to what the Write tool's
+   `is_within_project` already accepts; documented, not closed. Known residual
+   denylist gaps to evidence-gate next: `.github/actions/` (composite/JS actions
+   run in CI with the same org-token blast radius as workflows), `.github/CODEOWNERS`,
+   `.github/dependabot.yml`.
+
 ## When to Apply
+
+- Admitting any new write-capable command (a rule whose `allow` writes to a
+  destination operand): route its destination through `_destination_veto_reason`
+  at the honoring point — do not rely on the YAML pattern for containment, which
+  cannot resolve symlinks or detect control-plane paths (§5, §11).
 
 - Adding/reviewing any `permissions.yaml` rule, or any code deciding allow/deny on
   a raw shell command string.

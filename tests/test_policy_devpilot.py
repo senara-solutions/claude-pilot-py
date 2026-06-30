@@ -19,6 +19,7 @@ from claude_agent_sdk.types import ToolPermissionContext
 from claude_pilot.permissions import (
     _SUBSTITUTION_ALLOWLIST,
     _bash_allow_is_chain_safe,
+    _destination_veto_reason,
     create_permission_handler,
 )
 from claude_pilot.policy import Policy, evaluate, load_policy
@@ -476,19 +477,327 @@ def test_guard_substitution_in_source_vetoed_before_git_show_exception() -> None
     assert _bash_allow_is_chain_safe(_POLICY, "Bash", _bash(cmd)) is False
 
 
-def test_git_show_redirect_symlink_traversal_is_accepted_static_residual() -> None:
-    # DOCUMENTS an accepted residual (mika-arch session fe891012, cpp#35 / cpp#38):
-    # a relative, ..-free target through a *committed symlink* (`esc -> ../OUTSIDE`)
-    # passes the static rule and would write outside the worktree AT RUNTIME. Static
-    # policy is a pre-exec shape filter, not a runtime sandbox — it cannot detect
-    # symlinks. This is the SAME residual the deployed cp/mv/mkdir rules carry
-    # (asserted below for parity). Do NOT "fix" by tightening this regex (that would
-    # break the legitimate multi-component target `docs/plans/X.md`); true
-    # containment is runtime resolve-and-contain, tracked policy-wide in cpp#38.
+def test_git_show_redirect_symlink_traversal_string_layer_still_allows() -> None:
+    # The STRING-FILTER layer (policy + chain guard) intentionally still allows a
+    # relative, ..-free target through a committed symlink — a pre-exec shape
+    # filter cannot detect symlinks, and tightening the regex would break the
+    # legitimate multi-component target `docs/plans/X.md`. Containment is now
+    # closed one layer up, at runtime resolve-and-contain in the handler (cpp#38);
+    # see test_dest_validator_* below. This test pins that the string layer was
+    # NOT changed to do containment.
     assert _effective("git show e95a9d8f:payload > esc/passwd") == "allow"
-    # Parity: the pre-existing structural write rules share the identical residual.
     assert _effective("cp payload esc/passwd") == "allow"
     assert _effective("mkdir esc/newdir") == "allow"
+
+
+# ── cpp#38 + cpp#42: destination validator (containment + control-plane) ──────
+#
+# The string layer above stays lenient; the handler's destination validator
+# closes both residuals at runtime. Containment (cpp#38) is checked FIRST, the
+# control-plane denylist (cpp#42) SECOND. These tests build a real worktree on
+# disk with a committed symlink `esc -> ../OUTSIDE` so resolve-and-contain has
+# something to resolve.
+
+
+def _make_worktree(tmp_path: Path) -> str:
+    """A worktree dir with `docs/plans/` and a symlink `esc -> ../OUTSIDE` that
+    escapes it. Returns the worktree path (use as `cwd`)."""
+    worktree = tmp_path / "wt"
+    (worktree / "docs" / "plans").mkdir(parents=True)
+    (tmp_path / "OUTSIDE").mkdir()
+    (worktree / "esc").symlink_to("../OUTSIDE")
+    return str(worktree)
+
+
+def _dest_effective(cmd: str, cwd: str, policy: Policy = _POLICY) -> str:
+    """Effective decision of the FULL honoring path: policy + chain guard +
+    destination validator (the production order in the handler)."""
+    d = evaluate(policy, "Bash", _bash(cmd))
+    if d.decision != "allow":
+        return d.decision
+    if not _bash_allow_is_chain_safe(policy, "Bash", _bash(cmd)):
+        return "deny"
+    if _destination_veto_reason(cmd, cwd) is not None:
+        return "deny"
+    return "allow"
+
+
+# cpp#38 — symlink-traversal containment
+
+
+def test_dest_validator_ac38_1_git_show_symlink_escape_denied(tmp_path: Path) -> None:
+    cwd = _make_worktree(tmp_path)
+    assert _dest_effective("git show e95a9d8f:payload > esc/passwd", cwd) == "deny"
+
+
+def test_dest_validator_ac38_2_cp_symlink_escape_denied(tmp_path: Path) -> None:
+    cwd = _make_worktree(tmp_path)
+    assert _dest_effective("cp source esc/passwd", cwd) == "deny"
+
+
+def test_dest_validator_ac38_3_mv_symlink_escape_denied(tmp_path: Path) -> None:
+    cwd = _make_worktree(tmp_path)
+    assert _dest_effective("mv source esc/passwd", cwd) == "deny"
+
+
+def test_dest_validator_ac38_4_mkdir_symlink_escape_denied(tmp_path: Path) -> None:
+    cwd = _make_worktree(tmp_path)
+    assert _dest_effective("mkdir esc/newdir", cwd) == "deny"
+
+
+def test_dest_validator_ac38_5_git_show_legit_plan_allowed(tmp_path: Path) -> None:
+    cwd = _make_worktree(tmp_path)
+    # cpp#35 founding trigger — must STAY allowed (positive regression).
+    assert (
+        _dest_effective("git show e95a9d8f:legit > docs/plans/X-plan.md", cwd)
+        == "allow"
+    )
+
+
+def test_dest_validator_ac38_6_cp_in_worktree_allowed(tmp_path: Path) -> None:
+    cwd = _make_worktree(tmp_path)
+    assert _dest_effective("cp source docs/plans/copy.md", cwd) == "allow"
+
+
+# cpp#42 — control-plane denylist (in-worktree but compromises the agent)
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "git show e95a9d8f:payload > .git/hooks/post-checkout",          # AC42.1
+        "git show e95a9d8f:payload > .github/workflows/ci.yml",         # AC42.2
+        "git show e95a9d8f:payload > .claude/commands/mika.md",         # AC42.3
+        "git show e95a9d8f:payload > skills/bundled/dispatch-lib.sh",   # AC42.4
+        "cp source .git/config",                                        # AC42.5
+        "cp source .mika/runtime.json",                                 # .mika denylist
+    ],
+)
+def test_dest_validator_ac42_control_plane_denied(cmd: str, tmp_path: Path) -> None:
+    cwd = _make_worktree(tmp_path)
+    assert _dest_effective(cmd, cwd) == "deny"
+
+
+def test_dest_validator_ac42_7_gitignore_allowed(tmp_path: Path) -> None:
+    cwd = _make_worktree(tmp_path)
+    # Top-level dotfile — NOT control plane; the `(/|$)` anchor stops at `.git`
+    # only when followed by `/` or end, so `.gitignore` (next char `i`) passes.
+    assert _dest_effective("git show e95a9d8f:payload > .gitignore", cwd) == "allow"
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        # Bare control-plane directory/file targets: the write lands ON or INSIDE
+        # the control plane even though the operand has no trailing path. The
+        # `(/|$)` anchor closes this — a bare-slash `^\.git/` would have let these
+        # through (regression guard for the `-t` and bare-dest evasion class).
+        "cp source .git",                 # overwrites the worktree gitdir pointer file
+        "git show e95a9d8f:payload > .git",
+        "cp -t .git source",              # writes .git/source
+        "cp -t .claude evil.md",          # writes .claude/evil.md
+        "cp -t .mika source",             # writes .mika/source
+        "mkdir .claude",                  # re-creates / targets the control-plane dir
+    ],
+)
+def test_dest_validator_bare_control_plane_target_denied(cmd: str, tmp_path: Path) -> None:
+    cwd = _make_worktree(tmp_path)
+    assert _dest_effective(cmd, cwd) == "deny"
+
+
+def test_dest_validator_well_known_agents_anchored_exact(tmp_path: Path) -> None:
+    cwd = _make_worktree(tmp_path)
+    # The mika-identities entry is exact-path-anchored ($): the real path denies,
+    # a same-named file elsewhere passes containment + control-plane.
+    assert (
+        _dest_effective(
+            "git show e95a9d8f:x > crates/mika-agent/src/well_known_agents.rs", cwd
+        )
+        == "deny"
+    )
+    assert (
+        _dest_effective("git show e95a9d8f:x > docs/well_known_agents.rs", cwd)
+        == "allow"
+    )
+
+
+def test_dest_validator_containment_precedes_control_plane(tmp_path: Path) -> None:
+    # Order is load-bearing: a symlink that escapes the worktree AND looks
+    # control-plane must be denied as a CONTAINMENT failure (cpp#38), reported
+    # before the denylist would ever see an in-worktree relative path.
+    cwd = _make_worktree(tmp_path)
+    reason = _destination_veto_reason(
+        "git show e95a9d8f:payload > esc/.git/hooks/x", cwd
+    )
+    assert reason is not None
+    assert "outside the worktree" in reason
+
+
+# cpp#38 + cpp#42 — full handler integration (interrupt semantics preserved)
+
+
+def test_dest_validator_handler_denies_with_interrupt(tmp_path: Path) -> None:
+    cwd = _make_worktree(tmp_path)
+    handler = create_permission_handler(
+        config=None, relay=False, verbose=False, cwd=cwd, policy_path=_BUNDLED
+    )
+    result = asyncio.run(
+        handler("Bash", _bash("git show e95a9d8f:payload > .git/hooks/post-checkout"), _mock_ctx())
+    )
+    assert isinstance(result, PermissionResultDeny)
+    assert result.interrupt is True
+
+
+def test_dest_validator_handler_allows_legit_in_worktree(tmp_path: Path) -> None:
+    cwd = _make_worktree(tmp_path)
+    handler = create_permission_handler(
+        config=None, relay=False, verbose=False, cwd=cwd, policy_path=_BUNDLED
+    )
+    result = asyncio.run(
+        handler("Bash", _bash("git show e95a9d8f:legit > docs/plans/X-plan.md"), _mock_ctx())
+    )
+    assert isinstance(result, PermissionResultAllow)
+
+
+# cp -t / --target-directory / combined short-flag target forms: the real write
+# destination is <DIR>/<src>, so DIR must be the validated operand (else a benign
+# source operand is checked while bytes land in an unchecked directory).
+
+
+@pytest.mark.parametrize(
+    "cmd, expected",
+    [
+        ("cp -t out/ a b", ["out/"]),
+        ("cp --target-directory out/ a b", ["out/"]),
+        ("cp --target-directory=out/ a b", ["out/"]),
+        ("cp -rt out/ a b", ["out/"]),            # combined short flags ending in t
+        ("cp -vt out/ a", ["out/"]),
+        ("mv -t out/ a", ["out/"]),
+        ("cp a b c dest/", ["dest/"]),            # no -t: last positional is dest
+        ("cp a b", ["b"]),
+        ("cp a", None),                            # no destination -> fail closed
+    ],
+)
+def test_extract_cp_mv_destination(cmd: str, expected: object) -> None:
+    from claude_pilot.permissions import _extract_cp_mv_destination
+
+    assert _extract_cp_mv_destination(cmd) == expected
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "cp -rt esc payload",                      # combined short flag -> symlink escape
+        "cp -vt esc payload",
+        "cp -t esc payload",                       # plain -t -> symlink escape
+        "cp -rt .github/workflows evil.yml",       # combined short flag -> control plane
+        "cp --target-directory=.claude evil.md",   # =form -> control plane
+    ],
+)
+def test_dest_validator_target_directory_forms_denied(cmd: str, tmp_path: Path) -> None:
+    worktree = tmp_path / "wt"
+    (worktree / ".github" / "workflows").mkdir(parents=True)
+    (worktree / ".claude").mkdir()
+    (tmp_path / "OUTSIDE").mkdir()
+    (worktree / "esc").symlink_to("../OUTSIDE")
+    assert _dest_effective(cmd, str(worktree)) == "deny"
+
+
+@pytest.mark.parametrize(
+    "cmd, src_marker",
+    [
+        ("git show e95a9d8f:payload >x", "x"),     # no space after >
+        ("git show e95a9d8f:payload > x", "x"),
+        ("git show e95a9d8f:payload >  x", "x"),   # multiple spaces
+    ],
+)
+def test_extract_git_show_redirect_whitespace(cmd: str, src_marker: str) -> None:
+    from claude_pilot.permissions import _extract_write_destinations
+
+    assert _extract_write_destinations("bash-git-show-redirect", cmd) == [src_marker]
+
+
+def test_dest_validator_compound_nonleading_segment_escape(tmp_path: Path) -> None:
+    # The per-segment loop must validate a NON-leading write segment, not just the
+    # first. A clean leading mkdir followed by an escaping cp must still deny.
+    cwd = _make_worktree(tmp_path)
+    assert _dest_effective("mkdir docs/x && cp s esc/p", cwd) == "deny"
+
+
+def test_dest_validator_compound_nonleading_segment_control_plane(tmp_path: Path) -> None:
+    cwd = _make_worktree(tmp_path)
+    assert _dest_effective("mkdir docs/x && cp s .git/config", cwd) == "deny"
+
+
+def test_dest_validator_mkdir_multi_target_one_bad(tmp_path: Path) -> None:
+    # mkdir validates EVERY directory operand: one good + one escaping -> deny.
+    cwd = _make_worktree(tmp_path)
+    assert _dest_effective("mkdir -p docs/ok esc/bad", cwd) == "deny"
+
+
+def test_dest_validator_mkdir_multi_target_all_good(tmp_path: Path) -> None:
+    cwd = _make_worktree(tmp_path)
+    assert _dest_effective("mkdir -p docs/a docs/b", cwd) == "allow"
+
+
+def test_extract_mkdir_destinations_multi() -> None:
+    from claude_pilot.permissions import _extract_mkdir_destinations
+
+    assert _extract_mkdir_destinations("mkdir -p a/b c/d") == ["a/b", "c/d"]
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        # P0 (cpp#42 adversarial review): embedding ` grep ` / `;jq` in an operand
+        # shadows the write rule under first-match-wins policy.evaluate, but the
+        # segment is still a cp/mv/mkdir write. Structural classification (leading
+        # command word) must catch these regardless of which policy rule matched.
+        'cp "payload grep x" .git/hooks/post-checkout',   # shadow -> control plane
+        'cp "payload grep x" esc/passwd',                 # shadow -> worktree escape
+        'mv "x grep y" esc/secret',
+        'mkdir ".git/hooks/x grep y"',
+        'cp "a;jq b" esc/passwd',                         # jq shadow
+        # Quoted destination with spaces: shlex tokenization must yield the real
+        # path so the symlink / control-plane component is seen (str.split would
+        # fragment it and validate the wrong token).
+        'cp src "esc/a grep b"',                          # escaping dest, quoted
+        'cp src ".git/hooks/post checkout"',              # control-plane dest, quoted
+    ],
+)
+def test_dest_validator_shadow_rule_and_quoted_dest_denied(cmd: str, tmp_path: Path) -> None:
+    worktree = tmp_path / "wt"
+    (worktree / ".git" / "hooks").mkdir(parents=True)
+    (tmp_path / "OUTSIDE").mkdir()
+    (worktree / "esc").symlink_to("../OUTSIDE")
+    assert _dest_effective(cmd, str(worktree)) == "deny"
+
+
+def test_dest_validator_shadow_bypass_blocked_through_handler(tmp_path: Path) -> None:
+    # End-to-end through the production handler: the shadowed write must DENY with
+    # interrupt=True, not slip through as an allow.
+    worktree = tmp_path / "wt"
+    (worktree / ".git" / "hooks").mkdir(parents=True)
+    handler = create_permission_handler(
+        config=None, relay=False, verbose=False, cwd=str(worktree), policy_path=_BUNDLED
+    )
+    result = asyncio.run(
+        handler("Bash", _bash('cp "payload grep x" .git/hooks/post-checkout'), _mock_ctx())
+    )
+    assert isinstance(result, PermissionResultDeny)
+    assert result.interrupt is True
+
+
+def test_dest_validator_fail_closed_on_unparseable_destination(tmp_path: Path) -> None:
+    # KTD-6: a write-capable rule whose destination cannot be parsed is vetoed.
+    # `cp -t out/` (target flag but no source/positional after) yields a dest the
+    # extractors cannot resolve into a real write -> fail-closed deny is exercised
+    # via a directly-constructed veto check on the extractor's None path.
+    from claude_pilot.permissions import _extract_write_destinations
+
+    assert _extract_write_destinations("bash-cp-mv", "cp a") is None
+    assert _extract_write_destinations("bash-git-show-redirect", "git show") is None
+    assert _extract_write_destinations("bash-mkdir", "mkdir") is None
 
 
 # ── Handler end-to-end: interrupt semantics (cpp#20 joint 2) ─────────────────
