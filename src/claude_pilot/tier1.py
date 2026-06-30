@@ -123,7 +123,16 @@ TIER3_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\bsh\s+-c\b"),
     re.compile(r"\beval\s"),
     re.compile(r"\bxargs\b"),
-    re.compile(r"\bfind\s.*-(exec|execdir|delete)\b"),
+    # NOTE: the blanket `find … -(exec|execdir|delete)` deny was REMOVED here
+    # (cpp#33). It was the SOLE protection for find's exec sub-feature, which
+    # the TIER3 header doctrine above forbids — a denylist entry must never be
+    # the only guard for a safe-listed command's sub-feature. find-exec safety
+    # now lives in the allow-list layer: `_is_safe_find_command()` admits
+    # `-exec/-execdir/-ok/-okdir <cmd>` only when every `<cmd>` is in the
+    # closed-world FIND_EXEC_SAFE_COMMANDS read-only allowlist, and denies
+    # `-delete` and any command-substitution. `sh -c`/`bash -c` wrappers inside
+    # `-exec` stay independently caught by the patterns just above (defense in
+    # depth).
     # NOTE: $( and backtick patterns removed — replaced by quote-aware
     # contains_unquoted_metacharacter() check in is_safe_bash_command().
     # See mika#946 (resolution of mika#938 F5 sentinel divergence).
@@ -151,7 +160,7 @@ def is_tier3_dangerous(command: str) -> bool:
 # the session DIES — so a single bad reach forces a manual rescue.
 #
 # This constant is injected into the SDK system prompt by agent.py. It lives
-# HERE, next to the patterns it describes (TIER3_PATTERNS, _FIND_DANGEROUS_RE,
+# HERE, next to the patterns it describes (TIER3_PATTERNS, FIND_EXEC_SAFE_COMMANDS,
 # SAFE_SHELL_COMMANDS, is_within_project), so the documentation cannot drift
 # from the enforcement. n=2 evidence: claude-pilot logs 6f97dc72 (find -exec
 # crashed the mika#1381 groom) and 548191b8 (cross-worktree md5sum crashed the
@@ -168,10 +177,15 @@ The permission policy DENIES the Bash patterns below, and a denied Bash call
 terminates this session immediately (no retry, no recovery). Never reach for
 them — use the auto-approved native tool, which accomplishes the same goal:
 
-- `find … -exec` / `find … -execdir` / `find … -delete` (denied as RCE-class,
-  regardless of path) → use the **Grep** tool to search file contents and the
-  **Glob** tool to find files by name. To search inside matched files, combine
-  Glob (find paths) then Grep (search them) — never `find -exec grep`.
+- `find … -exec`/`-execdir`/`-ok`/`-okdir` with a NON-read-only inner command
+  (e.g. `find … -exec rm`, `find … -exec sh -c …`, `find … -exec sudo …`), and
+  `find … -delete` (denied as filesystem-mutating / RCE-class, regardless of
+  path). Read-only inner commands (`grep`, `cat`, `head`, `tail`, `ls`, `stat`,
+  `wc`, `echo`, …) ARE auto-approved, so
+  `find . -name "*.rs" -exec grep -l "struct" {} \\;` runs without halting. Still
+  prefer the **Grep** tool to search file contents and the **Glob** tool to find
+  files by name — they never risk a denial — but a read-only `find … -exec` no
+  longer crashes the session.
 - Hashing or inspecting a file with a non-safe-listed command (e.g. `md5sum`,
   `sha256sum`) → use the **Read** tool to read the file directly. Only a small
   allow-list of read-only shell tools is auto-approved; others like `md5sum`
@@ -444,7 +458,94 @@ SAFE_SHELL_COMMANDS: frozenset[str] = frozenset({
 })
 
 _FIRST_WORD_RE = re.compile(r"^\s*(\S+)")
-_FIND_DANGEROUS_RE = re.compile(r"-(exec|execdir|delete)\b")
+
+# Closed-world allowlist of read-only commands permitted after find's exec-class
+# flags (cpp#33). find runs the inner command DIRECTLY (no shell), so the first
+# token after the flag is the binary that executes. We match it by exact-literal
+# equality against this set — we never parse the inner command's arguments or
+# semantics. This is the same shape ratified for the cpp#34 substitution
+# allowlist (docs/solutions/security-issues/command-string-policy-allow-rules-are-compound-unsafe.md §4):
+# over-blocking is the correct failure mode; widening the set is an
+# evidence-gated follow-up, not a code change made on a hunch.
+#
+# An entry belongs here ONLY if the binary cannot execute another command or
+# write a file through its OWN flags (we don't parse those flags). `rg`
+# (ripgrep) was REMOVED before merge: `rg --pre <CMD>` / `--hostname-bin` /
+# `--search-zip` execute external commands, so `find -exec rg --pre evil` is a
+# proven-live RCE (cpp#33 security review). The native Grep tool (ripgrep-backed)
+# covers the search use case without the exec surface.
+#
+# LOAD-BEARING PRECONDITION (cpp#44): `grep`/`egrep`/`fgrep` are read-only ONLY
+# under GNU grep. `ugrep` (a drop-in `grep` on some Gentoo/BSD/Homebrew hosts)
+# adds `--filter=CMD` / `--pager` / `--view`, which execute commands — the same
+# class as `rg --pre`. The pilot runs in standard-Linux containers where
+# `find -exec` resolves to GNU `/bin/grep`, so this is safe in the deployment
+# target; cpp#44 tracks verifying the container grep provider and reconsidering
+# these entries if a ugrep host is ever in scope. Do not add a new grep-family
+# entry without re-checking that precondition.
+FIND_EXEC_SAFE_COMMANDS: frozenset[str] = frozenset({
+    "grep", "egrep", "fgrep",
+    "cat", "head", "tail", "wc",
+    "ls", "stat", "file",
+    "basename", "dirname", "readlink", "realpath",
+    "echo", "printf",
+})
+
+# `-delete` is a built-in find action that removes matched files — always deny.
+_FIND_DELETE_RE = re.compile(r"-delete\b")
+# find's file-WRITING actions: `-fprintf FILE FORMAT` writes attacker-controlled
+# content to an arbitrary FILE; `-fprint`/`-fprint0`/`-fls` write filenames /
+# listings to FILE. None are exec or `-delete`, so they bypass the other guards
+# and would otherwise fall through to the pure-search allow path — an arbitrary
+# file-write primitive (cpp#33 security review, proven vs real bash). Deny them.
+# `\b` keeps `-fprint` from being a false prefix of `-fprintf`/`-fprint0`; the
+# stdout forms (`-printf`/`-print`/`-print0`/`-ls`) are not matched and stay
+# allowed.
+_FIND_WRITE_RE = re.compile(r"-(?:fprintf|fprint0|fprint|fls)\b")
+# `-exec`/`-execdir`/`-ok`/`-okdir` all run an external command; capture the
+# first token after each (the executed binary). Longest alternative first so
+# `-execdir`/`-okdir` aren't mis-split as `-exec`/`-ok`. `-ok`/`-okdir` are
+# folded in here (cpp#33) — they are exec-class (prompt-then-run) and were a
+# pre-existing auto-approval gap when only `-exec`/`-execdir` were guarded.
+_FIND_EXEC_INNER_RE = re.compile(r"-(?:execdir|exec|okdir|ok)\b\s+(\S+)")
+
+
+def _is_safe_find_command(sub: str) -> bool:
+    """Decide whether a `find` invocation is safe to auto-approve (cpp#33).
+
+    Safe iff it neither deletes, writes to a file, nor execs a non-read-only
+    command:
+
+    - `-delete` modifies the filesystem → deny.
+    - `-fprintf`/`-fprint`/`-fprint0`/`-fls` write to an arbitrary FILE → deny
+      (a write primitive that is neither exec nor `-delete`).
+    - `-exec`/`-execdir`/`-ok`/`-okdir` run an external command → allow only
+      when EVERY such inner command is in FIND_EXEC_SAFE_COMMANDS (exact-literal
+      match; no inner-argument parsing).
+    - Any command substitution (`$(`, backtick, `$'`) anywhere in the find
+      invocation → deny. A legitimate read-only `find … -exec grep PATTERN …`
+      never needs substitution; bash expands `$()`/backtick BEFORE find runs, so
+      their presence means an outer substitution is smuggling execution. This
+      guard makes the find path sound independent of whether
+      ``contains_unquoted_metacharacter`` catches double-quoted `$()` (it does
+      NOT today — see the separately-filed broader-gap ticket). Mirrors the
+      permissions.py cpp#34 §4 rule that backtick/`$'` are never allowlistable.
+    - No exec-class clause and no `-delete` → a pure read-only search → allow.
+
+    `sh -c`/`bash -c` inside `-exec` are denied here (not in the allowlist) and
+    independently by the TIER3 `sh -c`/`bash -c` patterns (defense in depth).
+    """
+    if _FIND_DELETE_RE.search(sub) or _FIND_WRITE_RE.search(sub):
+        return False
+
+    inner_commands = _FIND_EXEC_INNER_RE.findall(sub)
+    if not inner_commands:
+        return True  # pure search — no exec-class clause, no -delete
+
+    if "$(" in sub or "`" in sub or "$'" in sub:
+        return False
+
+    return all(inner in FIND_EXEC_SAFE_COMMANDS for inner in inner_commands)
 
 
 def is_safe_shell_command(sub: str) -> bool:
@@ -456,8 +557,8 @@ def is_safe_shell_command(sub: str) -> bool:
     if cmd not in SAFE_SHELL_COMMANDS:
         return False
 
-    if cmd == "find" and _FIND_DANGEROUS_RE.search(sub):
-        return False
+    if cmd == "find":
+        return _is_safe_find_command(sub)
 
     return True
 
