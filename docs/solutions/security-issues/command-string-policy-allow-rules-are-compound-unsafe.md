@@ -7,7 +7,7 @@ component: permission-classifier
 problem_type: security_issue
 category: security-issues
 severity: critical
-tags: [permissions, policy, bash, regex, heredoc, allow-list, rce, symlink, toctou, command-substitution, find-exec, claude-pilot-25, claude-pilot-33, claude-pilot-34, claude-pilot-35]
+tags: [permissions, policy, bash, regex, heredoc, allow-list, rce, symlink, toctou, command-substitution, find-exec, ref-resolution, claude-pilot-25, claude-pilot-33, claude-pilot-34, claude-pilot-35, claude-pilot-43]
 applies_when: "adding or reviewing any rule that decides allow/deny on a raw shell command string"
 ---
 
@@ -245,6 +245,47 @@ The unifying rule: a closed-world allowlist fails open in two places a name list
 hides — an *entry* whose own flags exec/write, and an *action* of a multi-action
 command that the guard didn't enumerate. Verify the premise of each entry; deny
 the unknown action.
+
+### 7. A regex's syntactic shape is not a runtime-identity guarantee — document what the matched bytes can REFER TO, not what they look like
+
+The `bash-git-show-redirect` rule (§5, cpp#35) matches `^git show [a-f0-9]+:`.
+Its original rationale — in both the `permissions.yaml` `reason:` and the
+`permissions.py` honoring-branch comment — justified the rule by asserting the
+source was an "immutable git object" (a SHA). **Empirically false.** A peer-Claude
+adversarial review of cpp#PR39 proved it on real git:
+
+```bash
+git checkout -b deadbeef          # a branch named with only hex chars
+echo attacker_controlled > file.txt
+git add file.txt && git commit -m x
+git show deadbeef:file.txt         # prints BRANCH content — mutable, force-pushable
+```
+
+git's ref resolution does **not** prefer a SHA over an identically-shaped ref name.
+For a name that is *only* a valid ref (not also a real abbreviated object) git
+resolves to the ref unambiguously; for a genuinely-both name (rare) git emits
+`refname is ambiguous` and still prefers the **ref**. So `[a-f0-9]+` admits full
+SHAs, abbreviated SHAs, **and** hex-named branches/tags — none guaranteed immutable.
+
+The rule was never made safe by source-immutability. Its safety rests **entirely**
+on the destination validator (§5: literal target, no absolute / `~` / `..` /
+shell-expansion) plus the control-plane denylist (cpp#42). Attacker-controlled
+source *content* is acceptable precisely because the destination constraint
+governs what bytes can land where.
+
+Tightening the regex to require a 40-hex full SHA was rejected (Option A): the
+founding cpp#35 trigger, dispatch-lib's plan-import, runs `git show <8-char
+abbrev>:...` and would regress. The honest fix (Option B, cpp#43) struck the
+immutability claim and documented "source is any hex-shaped ref; safety is
+destination-only."
+
+**Lesson:** when a regex's "what this matches" intent (here: "a SHA") diverges
+from "what the matched bytes can *refer to* at runtime" (here: any ref of that
+shape, mutable included), the rationale must document the **runtime semantics**,
+not the syntactic shape — and cite the runtime test that proves the divergence.
+This is the source-side twin of §5's destination-side corollary ("don't claim a
+stronger guarantee than the mechanism delivers"); both were caught post-merge by
+executed/adversarial review (§3), not by reading the diff.
 
 ## When to Apply
 
