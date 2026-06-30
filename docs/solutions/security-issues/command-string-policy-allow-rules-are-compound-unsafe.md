@@ -503,10 +503,9 @@ the Python side intentionally diverges (hardened) until the Rust side mirrors.
   write target** (`/tmp` heredoc, and every structural write rule —
   `bash-cp-mv`/`bash-mkdir`/`bash-git-show-redirect`) is a runtime concern
   outside static policy scope (see #5; closing it policy-wide = cpp#38).
-- **Known-open gap (filed cpp#47):** the sanctioned `cat > /tmp/<token> <<EOF`
-  exception (§2) returns BEFORE the §1/§4/§8 substitution-marker veto and admits an
-  *unquoted* `EOF` delimiter, so `$(…)` / backtick / `${ …; }` funsub in the heredoc
-  **body** expand and auto-approve (reproduced on bash 5.3.9). Distinct from the
-  accepted in-worktree-execution residual above: the sanctioned heredoc is *designed
-  to be inert*. Fix shape (quoted-delimiter restriction vs body-scan) needs an
-  architect call — see cpp#47.
+- **Resolved (cpp#47):** the sanctioned `cat > /tmp/<token> <<EOF` exception (§2)
+  formerly admitted an *unquoted* `EOF` delimiter, so `$(…)` / backtick / `${ …; }`
+  funsub in the heredoc **body** expanded and auto-approved before the
+  substitution-marker veto ran (reproduced on bash 5.3.9). Fixed by requiring a
+  **quoted** delimiter (`<<'EOF'` / `<<"EOF"`), which disables body expansion and
+  makes the body provably inert — see §2 and `_SANCTIONED_HEREDOC_OPENER_RE`.
