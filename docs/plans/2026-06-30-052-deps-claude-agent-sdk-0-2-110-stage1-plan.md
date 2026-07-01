@@ -7,8 +7,8 @@ Issue: cpp#52 · Branch: `deps/52/claude-agent-sdk-0-2-110-stage1`
 `claude-pilot` is the Python wrapper that runs every autonomous dispatch through the
 `claude-agent-sdk`. It was pinned at `0.1.59` while latest is `0.2.110` — a major `0.1→0.2`
 boundary plus 60+ skipped minors. The unreviewed-surface backlog keeps growing and the bundled
-Claude CLI (which actually runs in headless pilot sessions) ages with it. Vincent flagged the
-v0.2.110 release as priority. A research agent produced a friction analysis (cross-referencing
+Claude CLI (which actually runs in headless pilot sessions) ages with it. The
+v0.2.110 release was flagged as priority. A research agent produced a friction analysis (cross-referencing
 51 release bodies v0.1.60→v0.2.110) whose headline is: **the upgrade retires zero existing cpp
 workarounds outright — the SDK is orthogonal to cpp's shell-injection/permission gate** — and a
 short Stage-1 watch list of four items that need verification on the bump.

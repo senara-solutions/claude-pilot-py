@@ -2,7 +2,7 @@
 
 > - **Issue:** senara-solutions/mika#1409 (milestone-30 Loop Trustworthiness, p1-important)
 > - **Branch:** `fix/1409/claude-pilot-policy-denied-bash-tool`
-> - **Scope:** Prevention-only (Approach #2) per Mika Prime's 2026-06-05 scope-ruling. Approach #1 (recoverable denials) is DEFERRED to mika#1410.
+> - **Scope:** Prevention-only (Approach #2) per 2026-06-05 scope-ruling. Approach #1 (recoverable denials) is DEFERRED to mika#1410.
 > - **Hard constraint:** `permissions.py` UNCHANGED — cpp#20 joint-2 `interrupt=True` honest-halt contract preserved.
 
 ## WHY (problem + evidence)

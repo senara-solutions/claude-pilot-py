@@ -391,7 +391,7 @@ the verify-pipeline-passes-without-the-fix learning).
   pre-existing denials unaffected (U3).
 - `ruff` + `mypy` + `pytest` green.
 - PR opened with `Closes #35`; **not** author-self-merged (AC4 — security
-  boundary, per Mika Prime).
+  boundary, per architect).
 
 ---
 
