@@ -9,7 +9,7 @@ authors = [{ name = "Senara Solutions" }]
 dependencies = [
   "claude-agent-sdk==0.2.110",
   "pydantic>=2.6,<3",
-  "pyyaml>=6.0,<7",
+  "pyyaml>=6.0.3,<7",
   "python-dotenv>=1.0",
   # Transitive security pins for cpp#66 (2026-07-04 Dependabot cleanup — public-flip alert cleanup).
   # These packages are pulled in by claude-agent-sdk / cryptography stack but cpp does not
