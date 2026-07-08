@@ -31,6 +31,7 @@ src/claude_pilot/inbox_writer.py → mika#1189 side-channel handoff to mika-gate
 src/claude_pilot/ui.py           → Stderr log renderer (ANSI colors)
 src/claude_pilot/types.py        → Pydantic models: PilotConfig, PilotEvent, PilotResponse, ResultJson
 src/claude_pilot/logger.py       → File + stderr sink with ANSI stripping
+src/claude_pilot/ipython/        → Optional %claude / %%claude IPython magics ([ipython] extra, cpp#81)
 ```
 
 **Flow:** CLI → `ClaudeSDKClient(options={can_use_tool})` → on tool permission needed → format `PilotEvent` → invoke external command via `asyncio.create_subprocess_exec` (stdin JSON) → validate response with Pydantic → map to SDK `PermissionResultAllow`/`Deny` → return to SDK.

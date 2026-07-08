@@ -27,12 +27,19 @@ dependencies = [
 claude-pilot = "claude_pilot.cli:main"
 
 [project.optional-dependencies]
+# IPython magic surface (claude-pilot#81). IPython is NOT a hard dependency of
+# the base package — `claude_pilot.ipython` defers its IPython imports to
+# %load_ext time so the CLI works without the extra installed.
+ipython = [
+  "ipython>=8",
+]
 dev = [
   "pytest>=9.1.1",
   "pytest-asyncio>=0.23",
   "ruff>=0.15.20",
   "mypy>=2.1.0",
   "types-PyYAML>=6.0.12.20260518",
+  "ipython>=8",  # exercises the [ipython] extra's magics in the test suite
 ]
 
 [build-system]
@@ -61,6 +68,13 @@ strict = true
 warn_unreachable = true
 disallow_untyped_defs = true
 ignore_missing_imports = true
+
+# IPython ships no py.typed, so its magic decorators (@magics_class,
+# @line_cell_magic) are Any-typed and trip strict's untyped-decorator check.
+# Scoped to the one module that uses them; everything else stays strict.
+[[tool.mypy.overrides]]
+module = "claude_pilot.ipython.magics"
+disallow_untyped_decorators = false
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
