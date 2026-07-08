@@ -64,6 +64,32 @@ Place `.claude/claude-pilot.json` in the target project:
 
 Guardrail fields are optional — defaults apply when omitted. CLI flags override config file values. Set a threshold to `0` to disable that specific guardrail.
 
+## IPython magics
+
+Optional REPL surface: drive a Claude Code session from IPython (≥8) or Jupyter with the same permission chain as the headless pilot.
+
+```bash
+pip install 'claude-pilot[ipython]'
+```
+
+```python
+%load_ext claude_pilot.ipython
+%claude "Summarize the git log of this repo"
+```
+
+`%claude "prompt"` runs a single-turn exchange in a fresh session, streaming the response into the cell. `%%claude` uses the cell body as the prompt and keeps **one session alive across invocations** in the kernel, so follow-up cells continue the same conversation:
+
+```python
+%%claude
+What does src/claude_pilot/tier1.py guard against?
+```
+
+Notes:
+
+- **Permissions are inherited, not re-implemented** — the magics build their `can_use_tool` callback from the same Tier-1 filter → policy → relay chain as the CLI. A kernel has no TTY, so the interactive fallback auto-denies; being in a REPL grants no silent privilege widening.
+- **Config discovery matches the CLI** — `.claude/claude-pilot.json` in the kernel's working directory enables the relay; without it the policy chain still applies.
+- **No extra runtime** — same pure-Python path through `claude-agent-sdk` as the headless pilot; no Node.js required.
+
 ## Architecture
 
 ```
@@ -76,6 +102,7 @@ src/claude_pilot/guardrails.py   → Session termination guardrails
 src/claude_pilot/ui.py           → Stderr log renderer (ANSI colors)
 src/claude_pilot/types.py        → PilotConfig, PilotEvent, PilotResponse, ResultJson (Pydantic)
 src/claude_pilot/logger.py       → File + stderr sink with ANSI stripping for files
+src/claude_pilot/ipython/        → Optional %claude / %%claude IPython magics ([ipython] extra)
 ```
 
 ## Development
