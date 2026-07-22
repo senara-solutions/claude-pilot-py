@@ -32,7 +32,7 @@ claude-pilot = "claude_pilot.cli:main"
 # the base package — `claude_pilot.ipython` defers its IPython imports to
 # %load_ext time so the CLI works without the extra installed.
 ipython = [
-  "ipython>=8",
+  "ipython>=9.15.0",
 ]
 dev = [
   "pytest>=9.1.1",
@@ -40,7 +40,7 @@ dev = [
   "ruff>=0.15.20",
   "mypy>=2.1.0",
   "types-PyYAML>=6.0.12.20260518",
-  "ipython>=8",  # exercises the [ipython] extra's magics in the test suite
+  "ipython>=9.15.0",  # exercises the [ipython] extra's magics in the test suite
 ]
 
 [build-system]
