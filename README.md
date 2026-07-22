@@ -64,6 +64,23 @@ Place `.claude/claude-pilot.json` in the target project:
 
 Guardrail fields are optional — defaults apply when omitted. CLI flags override config file values. Set a threshold to `0` to disable that specific guardrail.
 
+## Permission-policy mode
+
+`claude-pilot` ships two Bash permission-policy evaluators, selectable via
+`MIKA_PERMISSION_POLICY_MODE`:
+
+- `classic` *(default)* — syntactic pattern-matching over the shell text.
+- `per_spawn` — bashlex decomposition + per-binary safety functions
+  (Phase 1 opt-in, `mika#1708`).
+
+Downstream projects register per-binary safety functions via a plugin
+module referenced through `MIKA_PERMISSION_POLICY_MODULE=package.module:attribute`.
+The generic engine ships with an empty `DEFAULT_POLICY`; every deployment
+supplies its own contents.
+
+Full mode-selection guide, migration path, and audit-event wire shape:
+[`docs/permission-mode.md`](docs/permission-mode.md).
+
 ## IPython magics
 
 Optional REPL surface: drive a Claude Code session from IPython (≥8) or Jupyter with the same permission chain as the headless pilot.

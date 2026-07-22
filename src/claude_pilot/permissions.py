@@ -22,6 +22,7 @@ from typing import Any
 from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 from claude_agent_sdk.types import ToolPermissionContext
 
+from . import audit, per_spawn
 from .guardrails import SessionGuardrails
 from .policy import Policy, evaluate, load_policy
 from .tier1 import (
@@ -64,6 +65,67 @@ CanUseTool = Callable[
     [str, dict[str, Any], ToolPermissionContext],
     Awaitable[PermissionResult],
 ]
+
+
+# ── Per-spawn permission-policy mode (mika#1708) ─────────────────────────────
+#
+# ``MIKA_PERMISSION_POLICY_MODE`` selects which Bash evaluator fires:
+# - ``classic`` (default): existing syntactic tier1 + policy.yaml stack.
+# - ``per_spawn``: new bashlex-decomposing per-binary evaluator in
+#   :mod:`claude_pilot.per_spawn`.
+#
+# The switch is Bash-scoped. Non-Bash tools always follow the classic
+# tier1 / policy path — per_spawn only replaces the shell-parsing half.
+#
+# Mika-side ships its allow/deny CONTENTS via a plugin module referenced
+# through ``MIKA_PERMISSION_POLICY_MODULE=package.module:attribute``. This
+# module ships an empty default policy so the OSS release carries no
+# Mika-specific safety functions (SSC boundary discipline).
+#
+# Migration path (per architect-ratified spec):
+# - Phase 1: opt-in. Default ``classic``. Operators flip a canary via env
+#   var. Audit events (:mod:`claude_pilot.audit`) let mika-side monitor.
+# - Phase 2: flip default after N dispatches + zero blocks.
+# - Phase 3: retire ``tier1.py`` shell paths.
+
+PERM_MODE_CLASSIC = "classic"
+PERM_MODE_PER_SPAWN = "per_spawn"
+_VALID_PERM_MODES = frozenset({PERM_MODE_CLASSIC, PERM_MODE_PER_SPAWN})
+
+
+def _resolve_perm_mode() -> str:
+    """Read ``MIKA_PERMISSION_POLICY_MODE`` env var, defaulting to classic.
+
+    Unknown values fall back to ``classic`` (fail-safe: never accidentally
+    engage the new evaluator due to a typo).
+    """
+    raw = os.environ.get("MIKA_PERMISSION_POLICY_MODE", "").strip().lower()
+    if raw in _VALID_PERM_MODES:
+        return raw
+    return PERM_MODE_CLASSIC
+
+
+def _load_per_spawn_policy() -> dict[str, per_spawn.PolicyFn]:
+    """Load the per-spawn policy registry.
+
+    Reads ``MIKA_PERMISSION_POLICY_MODULE`` — a ``package.module:attribute``
+    reference. If unset, returns the empty :data:`per_spawn.DEFAULT_POLICY`.
+    On load error, logs to stderr and falls back to empty (fail-safe: every
+    spawn will reject, which drops through to classic tier2 / relay rather
+    than silently allowing anything).
+    """
+    module_ref = os.environ.get("MIKA_PERMISSION_POLICY_MODULE", "").strip()
+    if not module_ref:
+        return per_spawn.DEFAULT_POLICY
+    try:
+        return per_spawn.load_policy_from_module(module_ref)
+    except Exception as e:
+        _policy_logger.warning(
+            "MIKA_PERMISSION_POLICY_MODULE=%r failed to load: %s: %s. "
+            "Falling back to empty policy.",
+            module_ref, type(e).__name__, e,
+        )
+        return per_spawn.DEFAULT_POLICY
 
 
 # ── Chained-danger guard over policy Bash allow (claude-pilot#25) ────────────
@@ -538,12 +600,57 @@ def create_permission_handler(
     policy = load_policy(policy_path)
     policy_enabled = os.environ.get("MIKA_PILOT_POLICY_DISABLED", "").strip() != "1"
 
+    # Per-spawn permission-policy mode (mika#1708). Cached at handler creation
+    # so a mid-session env-var flip does not race — a rollback flip takes
+    # effect on the next dispatch's handler, not mid-session.
+    perm_mode = _resolve_perm_mode()
+    per_spawn_policy = _load_per_spawn_policy() if perm_mode == PERM_MODE_PER_SPAWN else {}
+    audit.emit(
+        "perm_policy_mode",
+        {
+            "mode": perm_mode,
+            "policy_size": len(per_spawn_policy) if perm_mode == PERM_MODE_PER_SPAWN else None,
+            "task_id": task_id,
+        },
+    )
+
     async def handler(
         tool_name: str,
         tool_input: dict[str, Any],
         ctx: ToolPermissionContext,
     ) -> PermissionResult:
         log_tool_request(tool_name, _summarize_input(tool_name, tool_input))
+
+        # Per-spawn Bash evaluator (mika#1708). When enabled, this REPLACES
+        # tier1's ``is_safe_bash_command`` for Bash tools only. On allow,
+        # skip straight to the Allow return. On deny, emit a rollback audit
+        # event and fall through to the classic Tier 2 policy / relay path
+        # so the classic evaluator has a chance to weigh in (defense in
+        # depth during Phase 1 opt-in — see plan doc).
+        if perm_mode == PERM_MODE_PER_SPAWN and tool_name == "Bash":
+            command = tool_input.get("command", "")
+            if isinstance(command, str) and command.strip():
+                ps_result = per_spawn.evaluate(
+                    command, initial_cwd=cwd, policy=per_spawn_policy
+                )
+                if ps_result.allowed:
+                    log_tool(
+                        tool_name,
+                        _summarize_input(tool_name, tool_input),
+                        "AUTO",
+                    )
+                    return PermissionResultAllow(updated_input=tool_input)
+                audit.emit(
+                    "perm_policy_rollback",
+                    {
+                        "mode": perm_mode,
+                        "reason": ps_result.reason,
+                        "command_head": command[:120],
+                        "spawn_count": len(ps_result.spawns),
+                        "task_id": task_id,
+                    },
+                )
+                # Fall through to classic evaluators — they may still allow.
 
         # Tier 1 fast path
         if is_tier1_auto_approve(tool_name, tool_input, cwd):

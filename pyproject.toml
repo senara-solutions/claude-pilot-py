@@ -21,6 +21,7 @@ dependencies = [
   "cryptography>=49.0.0",       # vulnerable OpenSSL included in cryptography wheels
   "idna>=3.18",                 # CVE-2026-45409 — IDNA encoding bypass of CVE-2024-3651 fix
   "pydantic-settings>=2.14.2",  # secrets_dir symlink escape
+  "bashlex>=0.18",
 ]
 
 [project.scripts]
