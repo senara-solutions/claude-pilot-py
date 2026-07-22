@@ -36,7 +36,7 @@ ipython = [
 ]
 dev = [
   "pytest>=9.1.1",
-  "pytest-asyncio>=0.23",
+  "pytest-asyncio>=1.4.0",
   "ruff>=0.15.20",
   "mypy>=2.1.0",
   "types-PyYAML>=6.0.12.20260518",
